@@ -107,6 +107,7 @@ temp/
 *.tmp
 *.temp
 *.bak
+.cache/
 
 # Documentation build
 docs/_build/
