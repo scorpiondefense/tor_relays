@@ -1,0 +1,119 @@
+# Docker Compose configuration for Tor Relay
+# Usage: docker-compose up -d
+
+version: '3.8'
+
+services:
+  tor-relay:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tor-relay:latest
+    container_name: tor-relay
+    restart: unless-stopped
+
+    # Port mappings
+    ports:
+      - "9001:9001"      # OR port
+      - "9030:9030"      # Directory port (optional)
+      # - "9090:9090"    # Metrics port (uncomment if enabled)
+
+    # Volumes for persistent data
+    volumes:
+      - tor-data:/var/lib/tor
+      - ./config/relay.toml:/etc/tor/relay.toml:ro
+      - ./logs:/var/log/tor
+
+    # Environment variables (override config file)
+    environment:
+      - TOR_RELAY_NICKNAME=${TOR_RELAY_NICKNAME:-MyDockerRelay}
+      - TOR_RELAY_CONTACT=${TOR_RELAY_CONTACT:-admin@example.com}
+      - TOR_RELAY_MODE=${TOR_RELAY_MODE:-middle}
+
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+
+    # Security settings
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE  # Only needed if using port < 1024
+    read_only: true
+    tmpfs:
+      - /tmp:size=100M
+
+    # Logging
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+
+    # Health check
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "9001"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+    # Network
+    networks:
+      - tor-network
+
+# Exit relay configuration (uncomment to use)
+#  tor-exit:
+#    build:
+#      context: .
+#      dockerfile: Dockerfile
+#    image: tor-relay:latest
+#    container_name: tor-exit
+#    restart: unless-stopped
+#    ports:
+#      - "9002:9001"
+#    volumes:
+#      - tor-exit-data:/var/lib/tor
+#      - ./config/exit.toml:/etc/tor/relay.toml:ro
+#    environment:
+#      - TOR_RELAY_MODE=exit
+#    networks:
+#      - tor-network
+
+# Bridge relay configuration (uncomment to use)
+#  tor-bridge:
+#    build:
+#      context: .
+#      dockerfile: Dockerfile
+#    image: tor-relay:latest
+#    container_name: tor-bridge
+#    restart: unless-stopped
+#    ports:
+#      - "443:9001"  # Often bridges use port 443
+#    volumes:
+#      - tor-bridge-data:/var/lib/tor
+#      - ./config/bridge.toml:/etc/tor/relay.toml:ro
+#    environment:
+#      - TOR_RELAY_MODE=bridge
+#    networks:
+#      - tor-network
+
+volumes:
+  tor-data:
+    driver: local
+  # tor-exit-data:
+  #   driver: local
+  # tor-bridge-data:
+  #   driver: local
+
+networks:
+  tor-network:
+    driver: bridge

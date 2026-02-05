@@ -1,0 +1,118 @@
+# Build directories
+build/
+cmake-build-*/
+out/
+
+# Conan
+CMakeUserPresets.json
+conan_toolchain.cmake
+conaninfo.txt
+conanbuildinfo.*
+graph_info.json
+.conan/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+!CMakeLists.txt
+compile_commands.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.cproject
+.settings/
+*.sublime-*
+
+# Compiled files
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+
+# Test artifacts
+Testing/
+CTestTestfile.cmake
+test_results/
+*.gcov
+*.gcda
+*.gcno
+coverage/
+coverage.info
+
+# Debug
+*.dSYM/
+core
+core.*
+
+# Logs
+*.log
+logs/
+
+# Data directories (runtime)
+data/
+keys/
+cached-*/
+
+# Secrets and keys (never commit!)
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+secret_*
+.env
+.env.*
+!.env.example
+
+# Docker
+.docker/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Linux
+*~
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Archives
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.7z
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+*.bak
+
+# Documentation build
+docs/_build/
+docs/html/
+docs/latex/
+
+# Package managers
+vcpkg_installed/
+_deps/
