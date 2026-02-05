@@ -6,6 +6,11 @@
 #include <memory>
 #include <string>
 
+// Forward declaration for Config (outside tor::modes namespace)
+namespace tor::util {
+class Config;
+}
+
 namespace tor::modes {
 
 // Relay operation modes
@@ -13,6 +18,7 @@ enum class RelayMode {
     Middle,  // Forward relay cells only (most common)
     Exit,    // Connect to external hosts
     Bridge,  // Forward only, unpublished in directory
+    Guard,   // Entry guard - first hop for client circuits
 };
 
 // Operations that modes can allow/deny
@@ -77,7 +83,7 @@ protected:
 // Factory function to create appropriate behavior
 [[nodiscard]] std::unique_ptr<RelayBehavior> create_behavior(
     RelayMode mode,
-    const class Config* config = nullptr
+    const ::tor::util::Config* config = nullptr
 );
 
 // Parse mode from string
@@ -89,6 +95,7 @@ protected:
         case RelayMode::Middle: return "Middle";
         case RelayMode::Exit: return "Exit";
         case RelayMode::Bridge: return "Bridge";
+        case RelayMode::Guard: return "Guard";
         default: return "Unknown";
     }
 }
@@ -108,12 +115,3 @@ protected:
 }
 
 }  // namespace tor::modes
-
-// Forward declaration for Config (avoid circular include)
-namespace tor::util {
-class Config;
-}
-
-namespace tor::modes {
-using Config = tor::util::Config;
-}

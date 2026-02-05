@@ -1,11 +1,12 @@
 #include "tor/modes/middle_relay.hpp"
+#include "tor/modes/guard_relay.hpp"
 #include "tor/util/config.hpp"
 
 namespace tor::modes {
 
 MiddleRelay::MiddleRelay() = default;
 
-MiddleRelay::MiddleRelay(const Config* config) : config_(config) {}
+MiddleRelay::MiddleRelay(const ::tor::util::Config* config) : config_(config) {}
 
 bool MiddleRelay::allows_operation(RelayOperation op) const {
     switch (op) {
@@ -148,7 +149,7 @@ MiddleRelay::forward_to_prev_hop(
 }
 
 // Factory function
-std::unique_ptr<RelayBehavior> create_behavior(RelayMode mode, const Config* config) {
+std::unique_ptr<RelayBehavior> create_behavior(RelayMode mode, const ::tor::util::Config* config) {
     switch (mode) {
         case RelayMode::Middle:
             return std::make_unique<MiddleRelay>(config);
@@ -158,6 +159,8 @@ std::unique_ptr<RelayBehavior> create_behavior(RelayMode mode, const Config* con
         case RelayMode::Bridge:
             // return std::make_unique<BridgeRelay>(config);
             return std::make_unique<MiddleRelay>(config); // Fallback for now
+        case RelayMode::Guard:
+            return std::make_unique<GuardRelay>(config);
         default:
             return std::make_unique<MiddleRelay>(config);
     }
@@ -172,6 +175,9 @@ std::expected<RelayMode, std::string> parse_relay_mode(const std::string& str) {
     }
     if (str == "bridge" || str == "Bridge" || str == "BRIDGE") {
         return RelayMode::Bridge;
+    }
+    if (str == "guard" || str == "Guard" || str == "GUARD") {
+        return RelayMode::Guard;
     }
     return std::unexpected("Unknown relay mode: " + str);
 }

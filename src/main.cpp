@@ -48,7 +48,7 @@ void print_usage(const char* program_name) {
               << "Tor Relay Implementation - C++20\n\n"
               << "Options:\n"
               << "  -c, --config FILE     Configuration file path\n"
-              << "  -m, --mode MODE       Relay mode: middle, exit, bridge (default: middle)\n"
+              << "  -m, --mode MODE       Relay mode: middle, exit, bridge, guard (default: middle)\n"
               << "  -p, --port PORT       OR port to listen on (default: 9001)\n"
               << "  -d, --dir-port PORT   Directory port (default: 0 = disabled)\n"
               << "  -n, --nickname NAME   Relay nickname\n"
@@ -62,16 +62,18 @@ void print_usage(const char* program_name) {
               << "  " << program_name << " --mode middle --port 9001\n"
               << "  " << program_name << " --mode exit --port 9001 --config /etc/tor/relay.toml\n"
               << "  " << program_name << " --mode bridge --port 443\n"
+              << "  " << program_name << " --mode guard --port 9001\n"
               << "\n"
               << "Modes:\n"
               << "  middle   Forward relay cells only (default, safest)\n"
               << "  exit     Connect to external hosts (requires exit policy)\n"
-              << "  bridge   Unpublished entry point for censored users\n";
+              << "  bridge   Unpublished entry point for censored users\n"
+              << "  guard    Entry guard - first hop for client circuits\n";
 }
 
 void print_version() {
-    std::cout << "Tor Relay Implementation v" << tor::core::VERSION_MAJOR << "."
-              << tor::core::VERSION_MINOR << "." << tor::core::VERSION_PATCH << "\n"
+    std::cout << "Tor Relay Implementation v" << static_cast<int>(tor::core::VersionInfo::MAJOR) << "."
+              << static_cast<int>(tor::core::VersionInfo::MINOR) << "." << static_cast<int>(tor::core::VersionInfo::PATCH) << "\n"
               << "Built with C++20, OpenSSL 3.x, Boost.Asio\n"
               << "Protocol versions: 4, 5\n";
 }
@@ -108,9 +110,9 @@ std::optional<CommandLineArgs> parse_args(int argc, char* argv[]) {
         if (arg == "-c" || arg == "--config") {
             args.config_file = value;
         } else if (arg == "-m" || arg == "--mode") {
-            auto mode_result = tor::util::parse_relay_mode(value);
+            auto mode_result = tor::modes::parse_relay_mode(value);
             if (!mode_result) {
-                std::cerr << "Error: Invalid mode '" << value << "'. Use: middle, exit, or bridge\n";
+                std::cerr << "Error: Invalid mode '" << value << "'. Use: middle, exit, bridge, or guard\n";
                 return std::nullopt;
             }
             args.mode = *mode_result;
@@ -148,7 +150,7 @@ std::optional<CommandLineArgs> parse_args(int argc, char* argv[]) {
             } else if (value == "info") {
                 args.log_level = tor::util::LogLevel::Info;
             } else if (value == "warn" || value == "warning") {
-                args.log_level = tor::util::LogLevel::Warning;
+                args.log_level = tor::util::LogLevel::Warn;
             } else if (value == "error") {
                 args.log_level = tor::util::LogLevel::Error;
             } else {
@@ -169,7 +171,7 @@ tor::util::Config create_config(const CommandLineArgs& args) {
 
     // If config file specified, load it first
     if (!args.config_file.empty()) {
-        auto result = tor::util::Config::load(args.config_file);
+        auto result = tor::util::Config::load_from_file(args.config_file);
         if (result) {
             config = std::move(*result);
         } else {
@@ -187,7 +189,7 @@ tor::util::Config create_config(const CommandLineArgs& args) {
     }
 
     if (!args.data_dir.empty()) {
-        config.data_directory = args.data_dir;
+        config.relay.data_dir = args.data_dir;
     }
 
     return config;
@@ -223,7 +225,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Setup logging
-    auto& logger = tor::util::Logger::instance();
+    auto& logger = tor::util::global_logger();
     logger.set_level(args.log_level);
     logger.add_sink(std::make_shared<tor::util::ConsoleSink>());
 
@@ -236,7 +238,7 @@ int main(int argc, char* argv[]) {
 
     // Ensure data directory exists
     try {
-        ensure_data_directory(config.data_directory);
+        ensure_data_directory(config.relay.data_dir.string());
     } catch (const std::exception& e) {
         LOG_ERROR("Failed to create data directory: {}", e.what());
         return 1;
@@ -252,7 +254,7 @@ int main(int argc, char* argv[]) {
             .build();
 
         if (!relay_result) {
-            LOG_ERROR("Failed to build relay: {}", relay_result.error().message());
+            LOG_ERROR("Failed to build relay: {}", tor::core::relay_error_message(relay_result.error()));
             return 1;
         }
 
@@ -261,7 +263,7 @@ int main(int argc, char* argv[]) {
         // Start the relay
         auto start_result = relay->start();
         if (!start_result) {
-            LOG_ERROR("Failed to start relay: {}", start_result.error().message());
+            LOG_ERROR("Failed to start relay: {}", tor::core::relay_error_message(start_result.error()));
             return 1;
         }
 
@@ -278,13 +280,13 @@ int main(int argc, char* argv[]) {
             if (g_reload_requested.exchange(false)) {
                 LOG_INFO("Reloading configuration...");
                 if (!args.config_file.empty()) {
-                    auto new_config_result = tor::util::Config::load(args.config_file);
+                    auto new_config_result = tor::util::Config::load_from_file(args.config_file);
                     if (new_config_result) {
-                        auto reload_result = relay->reload_config(*new_config_result);
-                        if (reload_result) {
+                        auto switch_result = relay->switch_mode(new_config_result->relay.mode);
+                        if (switch_result) {
                             LOG_INFO("Configuration reloaded successfully");
                         } else {
-                            LOG_ERROR("Failed to reload config: {}", reload_result.error().message());
+                            LOG_ERROR("Failed to reload config: {}", tor::core::relay_error_message(switch_result.error()));
                         }
                     } else {
                         LOG_ERROR("Failed to load config file");
@@ -301,7 +303,7 @@ int main(int argc, char* argv[]) {
         // Graceful shutdown
         auto stop_result = relay->stop();
         if (!stop_result) {
-            LOG_ERROR("Error during shutdown: {}", stop_result.error().message());
+            LOG_ERROR("Error during shutdown: {}", tor::core::relay_error_message(stop_result.error()));
         }
 
         LOG_INFO("Relay stopped");

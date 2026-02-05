@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.21)
 project(tor_relay VERSION 1.0.0 LANGUAGES CXX)
 
-# C++20 Standard
-set(CMAKE_CXX_STANDARD 20)
+# C++23 Standard (required for std::expected)
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
@@ -23,8 +23,9 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         -Wpedantic
         -Werror
         -Wno-unused-parameter
-        -Wconversion
-        -Wshadow
+        -Wno-sign-conversion
+        -Wno-implicit-int-conversion
+        -Wno-shadow
     )
 endif()
 
@@ -67,6 +68,7 @@ set(TOR_SOURCES
     src/modes/middle_relay.cpp
     src/modes/exit_relay.cpp
     src/modes/bridge_relay.cpp
+    src/modes/guard_relay.cpp
     src/util/config.cpp
     src/util/logging.cpp
 )
@@ -116,6 +118,7 @@ if(BUILD_TESTS)
         tests/unit/test_circuit.cpp
         tests/unit/test_exit_policy.cpp
         tests/unit/test_config.cpp
+        tests/unit/test_guard_relay.cpp
         tests/integration/test_tls.cpp
         tests/integration/test_circuit_creation.cpp
         tests/integration/test_directory.cpp

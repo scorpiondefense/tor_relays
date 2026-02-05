@@ -1,6 +1,7 @@
 #pragma once
 
 #include "tor/modes/relay_behavior.hpp"
+#include "tor/modes/bridge_relay.hpp"
 #include "tor/policy/exit_policy.hpp"
 #include "tor/policy/bandwidth.hpp"
 #include <cstdint>
@@ -62,6 +63,17 @@ struct BridgeConfig {
     std::string server_transport_plugin;  // Path to transport plugin
 };
 
+// Guard-specific configuration
+struct GuardConfig {
+    // Eligibility requirements for Guard flag
+    std::chrono::seconds min_uptime{8 * 24 * 3600};  // 8 days
+    size_t min_bandwidth{2 * 1024 * 1024};           // 2 MB/s
+
+    // Client tracking (privacy-preserving)
+    bool track_clients{true};
+    size_t max_tracked_clients{10000};
+};
+
 // Directory configuration
 struct DirectoryConfig {
     bool publish_server_descriptor{true};
@@ -119,6 +131,7 @@ public:
     RelayConfig relay;
     ExitConfig exit;
     BridgeConfig bridge;
+    GuardConfig guard;
     DirectoryConfig directory;
     SecurityConfig security;
     LoggingConfig logging;
@@ -134,6 +147,11 @@ public:
     // Check if running as bridge
     [[nodiscard]] bool is_bridge() const {
         return relay.mode == modes::RelayMode::Bridge;
+    }
+
+    // Check if running as guard
+    [[nodiscard]] bool is_guard() const {
+        return relay.mode == modes::RelayMode::Guard;
     }
 
 private:
