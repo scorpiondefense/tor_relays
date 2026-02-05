@@ -14,9 +14,10 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-# Compiler warnings
+# Compiler warnings (applied to project targets only, not dependencies)
+set(TOR_WARNINGS "")
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    add_compile_options(
+    set(TOR_WARNINGS
         -Wall
         -Wextra
         -Wpedantic
@@ -28,12 +29,12 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "MSVC")
-    add_compile_options(/W4 /WX)
+    set(TOR_WARNINGS /W4 /WX)
 endif()
 
 # Dependencies
 find_package(OpenSSL 3.0 REQUIRED)
-find_package(Boost 1.82 REQUIRED COMPONENTS system)
+find_package(Boost 1.82 REQUIRED)
 
 # Optional: Use Conan if available
 if(EXISTS "${CMAKE_BINARY_DIR}/conanbuildinfo.cmake")
@@ -79,19 +80,20 @@ target_include_directories(tor_lib PUBLIC
 target_link_libraries(tor_lib PUBLIC
     OpenSSL::SSL
     OpenSSL::Crypto
-    Boost::system
+    Boost::headers
 )
+target_compile_options(tor_lib PRIVATE ${TOR_WARNINGS})
 
-# Enable concepts and coroutines
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU")
+# Enable concepts and coroutines (only needed for older compilers)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS "11")
     target_compile_options(tor_lib PUBLIC -fconcepts -fcoroutines)
-elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-    target_compile_options(tor_lib PUBLIC -fcoroutines-ts)
 endif()
+# AppleClang and modern GCC/Clang support C++20 coroutines natively
 
 # Main executable
 add_executable(tor_relay src/main.cpp)
 target_link_libraries(tor_relay PRIVATE tor_lib)
+target_compile_options(tor_relay PRIVATE ${TOR_WARNINGS})
 
 # Testing
 option(BUILD_TESTS "Build test suite" ON)

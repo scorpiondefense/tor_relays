@@ -154,6 +154,97 @@ std::string IPv6Address::to_string() const {
     return oss.str();
 }
 
+std::expected<IPv6Address, PolicyError> IPv6Address::parse(const std::string& str) {
+    if (str == "*") {
+        return IPv6Address::any();
+    }
+
+    std::string addr_str = str;
+    uint8_t prefix = 128;
+
+    // Check for prefix
+    auto slash_pos = str.rfind('/');
+    if (slash_pos != std::string::npos) {
+        addr_str = str.substr(0, slash_pos);
+        auto prefix_str = str.substr(slash_pos + 1);
+        int prefix_val;
+        auto result = std::from_chars(prefix_str.data(),
+                                       prefix_str.data() + prefix_str.size(),
+                                       prefix_val);
+        if (result.ec != std::errc() || prefix_val < 0 || prefix_val > 128) {
+            return std::unexpected(PolicyError::InvalidCidr);
+        }
+        prefix = static_cast<uint8_t>(prefix_val);
+    }
+
+    // Remove brackets if present
+    if (!addr_str.empty() && addr_str.front() == '[') {
+        addr_str = addr_str.substr(1);
+    }
+    if (!addr_str.empty() && addr_str.back() == ']') {
+        addr_str = addr_str.substr(0, addr_str.size() - 1);
+    }
+
+    IPv6Address result_addr;
+    result_addr.prefix_len = prefix;
+
+    // Parse IPv6 address - split by colons
+    std::vector<std::string> parts;
+    size_t start = 0;
+    size_t end;
+    int double_colon_pos = -1;
+
+    while ((end = addr_str.find(':', start)) != std::string::npos) {
+        std::string part = addr_str.substr(start, end - start);
+        if (part.empty() && !parts.empty() && parts.back().empty()) {
+            // Double colon found
+            double_colon_pos = static_cast<int>(parts.size());
+        }
+        parts.push_back(part);
+        start = end + 1;
+    }
+    parts.push_back(addr_str.substr(start));
+
+    // Handle double colon expansion
+    if (double_colon_pos >= 0) {
+        size_t non_empty_count = 0;
+        for (const auto& p : parts) {
+            if (!p.empty()) non_empty_count++;
+        }
+        size_t zeros_needed = 8 - non_empty_count;
+        std::vector<std::string> expanded;
+        for (size_t i = 0; i < parts.size(); ++i) {
+            if (parts[i].empty() && static_cast<int>(i) == double_colon_pos) {
+                for (size_t j = 0; j < zeros_needed; ++j) {
+                    expanded.push_back("0");
+                }
+            } else if (!parts[i].empty()) {
+                expanded.push_back(parts[i]);
+            }
+        }
+        parts = expanded;
+    }
+
+    if (parts.size() != 8) {
+        return std::unexpected(PolicyError::InvalidAddress);
+    }
+
+    // Convert parts to bytes
+    for (size_t i = 0; i < 8; ++i) {
+        unsigned int val;
+        auto r = std::from_chars(parts[i].data(),
+                                  parts[i].data() + parts[i].size(),
+                                  val, 16);
+        if (r.ec != std::errc() || val > 0xFFFF) {
+            return std::unexpected(PolicyError::InvalidAddress);
+        }
+        result_addr.address[i * 2] = static_cast<uint8_t>((val >> 8) & 0xFF);
+        result_addr.address[i * 2 + 1] = static_cast<uint8_t>(val & 0xFF);
+    }
+
+    return result_addr;
+}
+
 // AddressPattern implementation
 bool AddressPattern::matches(uint32_t ipv4) const {
     if (type == Type::Any) return true;
