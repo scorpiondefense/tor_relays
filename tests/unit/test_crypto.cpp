@@ -214,12 +214,12 @@ TEST_CASE("AES-128-CTR encryption", "[crypto][aes][unit]") {
         auto init_result = cipher.init(key, nonce);
         REQUIRE(init_result.has_value());
 
-        auto encrypt_result = cipher.process(plaintext);
+        auto encrypt_result = cipher.process(std::span<const uint8_t>(plaintext));
         REQUIRE(encrypt_result.has_value());
 
         // Decrypt (reset and process ciphertext)
         cipher.reset();
-        auto decrypt_result = cipher.process(*encrypt_result);
+        auto decrypt_result = cipher.process(std::span<const uint8_t>(*encrypt_result));
         REQUIRE(decrypt_result.has_value());
 
         CHECK(*decrypt_result == plaintext);

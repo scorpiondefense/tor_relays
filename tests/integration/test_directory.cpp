@@ -1,5 +1,6 @@
 #include <catch2/catch_all.hpp>
 #include "tor/directory/descriptor.hpp"
+#include "tor/directory/authority.hpp"
 #include "tor/crypto/keys.hpp"
 #include "tor/policy/exit_policy.hpp"
 

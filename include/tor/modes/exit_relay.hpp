@@ -1,6 +1,7 @@
 #pragma once
 
 #include "tor/modes/relay_behavior.hpp"
+#include "tor/core/channel.hpp"
 #include "tor/policy/exit_policy.hpp"
 #include "tor/net/connection.hpp"
 #include <memory>
@@ -18,7 +19,7 @@ namespace tor::modes {
 class ExitRelay : public RelayBehavior {
 public:
     ExitRelay();
-    explicit ExitRelay(const Config* config);
+    explicit ExitRelay(const ::tor::util::Config* config);
     ~ExitRelay() override = default;
 
     // RelayBehavior interface
@@ -70,7 +71,7 @@ public:
     [[nodiscard]] uint64_t bytes_exited() const { return bytes_exited_; }
 
 private:
-    const Config* config_{nullptr};
+    const ::tor::util::Config* config_{nullptr};
     policy::ExitPolicy exit_policy_;
     std::shared_ptr<core::ChannelManager> channel_manager_;
 

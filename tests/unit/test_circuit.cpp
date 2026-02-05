@@ -1,4 +1,5 @@
 #include <catch2/catch_all.hpp>
+#include <thread>
 #include "tor/core/circuit.hpp"
 #include "tor/core/channel.hpp"
 #include "tor/crypto/ntor.hpp"
@@ -103,15 +104,15 @@ TEST_CASE("Circuit stream management", "[circuit][streams][unit]") {
     SECTION("Stream count increases") {
         CHECK(circuit->stream_count() == 0);
 
-        circuit->create_stream(1);
+        (void)circuit->create_stream(1);
         CHECK(circuit->stream_count() == 1);
 
-        circuit->create_stream(2);
+        (void)circuit->create_stream(2);
         CHECK(circuit->stream_count() == 2);
     }
 
     SECTION("Remove stream") {
-        circuit->create_stream(100);
+        (void)circuit->create_stream(100);
         CHECK(circuit->stream_count() == 1);
 
         circuit->remove_stream(100);
@@ -202,7 +203,7 @@ TEST_CASE("Circuit table", "[circuit][table][unit]") {
 
     SECTION("Remove circuit") {
         auto channel = std::make_shared<Channel>();
-        table.create_circuit(200, channel);
+        (void)table.create_circuit(200, channel);
         CHECK(table.exists(200));
 
         table.remove(200);
@@ -214,10 +215,10 @@ TEST_CASE("Circuit table", "[circuit][table][unit]") {
 
         CHECK(table.count() == 0);
 
-        table.create_circuit(1, channel);
+        (void)table.create_circuit(1, channel);
         CHECK(table.count() == 1);
 
-        table.create_circuit(2, channel);
+        (void)table.create_circuit(2, channel);
         CHECK(table.count() == 2);
 
         table.remove(1);
@@ -226,9 +227,9 @@ TEST_CASE("Circuit table", "[circuit][table][unit]") {
 
     SECTION("All circuits") {
         auto channel = std::make_shared<Channel>();
-        table.create_circuit(10, channel);
-        table.create_circuit(20, channel);
-        table.create_circuit(30, channel);
+        (void)table.create_circuit(10, channel);
+        (void)table.create_circuit(20, channel);
+        (void)table.create_circuit(30, channel);
 
         auto all = table.all_circuits();
         CHECK(all.size() == 3);

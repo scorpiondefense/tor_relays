@@ -114,7 +114,7 @@ public:
 private:
     std::string base_path_;
     size_t max_size_;
-    size_t max_files_;
+    [[maybe_unused]] size_t max_files_;
     size_t current_size_{0};
     std::unique_ptr<FileSink> current_file_;
     std::mutex mutex_;

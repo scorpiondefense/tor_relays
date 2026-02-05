@@ -15,7 +15,7 @@ namespace tor::modes {
 class MiddleRelay : public RelayBehavior {
 public:
     MiddleRelay();
-    explicit MiddleRelay(const Config* config);
+    explicit MiddleRelay(const ::tor::util::Config* config);
     ~MiddleRelay() override = default;
 
     // RelayBehavior interface
@@ -52,7 +52,7 @@ public:
     }
 
 private:
-    const Config* config_{nullptr};
+    const ::tor::util::Config* config_{nullptr};
     std::shared_ptr<core::ChannelManager> channel_manager_;
 
     // Forward relay cell to next hop

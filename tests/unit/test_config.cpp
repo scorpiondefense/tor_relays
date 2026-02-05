@@ -105,13 +105,13 @@ TEST_CASE("Relay operation names", "[config][unit]") {
 
 TEST_CASE("Bandwidth config", "[config][bandwidth][unit]") {
     SECTION("Unlimited config") {
-        auto config = policy::BandwidthManager::Config::unlimited();
+        auto config = tor::policy::BandwidthManager::Config::unlimited();
         CHECK(config.rate == 0);
         CHECK(config.burst == 0);
     }
 
     SECTION("Limited config") {
-        auto config = policy::BandwidthManager::Config::limited(10);  // 10 Mbps
+        auto config = tor::policy::BandwidthManager::Config::limited(10);  // 10 Mbps
         CHECK(config.rate == 10 * 1024 * 1024);  // 10 MB/s
     }
 }

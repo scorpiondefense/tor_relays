@@ -92,7 +92,7 @@ AesCtr128::process(std::span<const uint8_t> data) {
         return std::unexpected(AesError::EncryptionFailed);
     }
 
-    output.resize(len);
+    output.resize(static_cast<size_t>(len));
     return output;
 }
 

@@ -283,7 +283,7 @@ std::expected<uint32_t, HashError> RunningDigest::update_and_digest(
     }
 
     // Update our state too
-    hasher_.update(data);
+    (void)hasher_.update(data);
 
     // Return first 4 bytes as uint32
     return (static_cast<uint32_t>((*digest)[0]) << 24) |

@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdint>
 #include <expected>
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <optional>

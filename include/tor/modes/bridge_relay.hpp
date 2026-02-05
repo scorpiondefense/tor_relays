@@ -26,7 +26,7 @@ public:
     };
 
     BridgeRelay();
-    explicit BridgeRelay(const Config* config);
+    explicit BridgeRelay(const ::tor::util::Config* config);
     ~BridgeRelay() override = default;
 
     // RelayBehavior interface
@@ -81,7 +81,7 @@ public:
     [[nodiscard]] uint64_t clients_served() const { return clients_served_; }
 
 private:
-    const Config* config_{nullptr};
+    const ::tor::util::Config* config_{nullptr};
     Distribution distribution_{Distribution::None};
     std::string transport_name_;
     std::string bridge_authority_;

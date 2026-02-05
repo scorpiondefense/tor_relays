@@ -121,7 +121,7 @@ TEST_CASE("Cell serialization - Fixed cell", "[cell][serialization][unit]") {
 TEST_CASE("RelayCell parsing and serialization", "[cell][relay][unit]") {
     SECTION("DATA relay cell roundtrip") {
         std::vector<uint8_t> data = {0x01, 0x02, 0x03, 0x04, 0x05};
-        auto original = RelayCell::data(42, data);
+        auto original = RelayCell::make_data(42, data);
         auto serialized = original.serialize();
         auto parsed = RelayCell::parse(serialized);
 

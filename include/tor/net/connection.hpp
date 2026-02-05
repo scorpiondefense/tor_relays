@@ -119,7 +119,7 @@ public:
     // Get native socket
     [[nodiscard]] tcp::socket& socket() { return socket_; }
     [[nodiscard]] const tcp::socket& socket() const { return socket_; }
-    [[nodiscard]] int native_handle() const { return static_cast<int>(socket_.native_handle()); }
+    [[nodiscard]] int native_handle() { return static_cast<int>(socket_.native_handle()); }
 
     // Set socket options
     void set_no_delay(bool enable);

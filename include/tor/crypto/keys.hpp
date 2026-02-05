@@ -188,3 +188,20 @@ void secure_zero(void* ptr, size_t len);
 [[nodiscard]] std::vector<uint8_t> random_bytes(size_t len);
 
 }  // namespace tor::crypto
+
+// Hash specialization for NodeId to allow use in unordered containers
+namespace std {
+template<>
+struct hash<tor::crypto::NodeId> {
+    size_t operator()(const tor::crypto::NodeId& id) const noexcept {
+        const auto& data = id.data();
+        size_t result = 0;
+        // Simple FNV-1a-like hash over the node ID bytes
+        for (size_t i = 0; i < data.size(); ++i) {
+            result ^= static_cast<size_t>(data[i]);
+            result *= 0x100000001b3ULL;
+        }
+        return result;
+    }
+};
+}  // namespace std
