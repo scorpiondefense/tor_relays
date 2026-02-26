@@ -54,7 +54,8 @@ coverage.info
 
 # Debug
 *.dSYM/
-core
+# Core dumps (not src/core/)
+/core
 core.*
 
 # Logs
