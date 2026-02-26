@@ -98,9 +98,9 @@ target_link_libraries(tor_relay PRIVATE tor_lib)
 target_compile_options(tor_relay PRIVATE ${TOR_WARNINGS})
 
 # Testing
-option(BUILD_TESTS "Build test suite" ON)
+option(BUILD_TESTING "Build test suite" ON)
 
-if(BUILD_TESTS)
+if(BUILD_TESTING)
     include(FetchContent)
 
     FetchContent_Declare(
@@ -203,5 +203,5 @@ message(STATUS "  C++ Standard: ${CMAKE_CXX_STANDARD}")
 message(STATUS "  Compiler:     ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
 message(STATUS "  OpenSSL:      ${OPENSSL_VERSION}")
 message(STATUS "  Boost:        ${Boost_VERSION}")
-message(STATUS "  Tests:        ${BUILD_TESTS}")
+message(STATUS "  Tests:        ${BUILD_TESTING}")
 message(STATUS "")
