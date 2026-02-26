@@ -136,6 +136,7 @@ public:
     from_bytes(std::span<const uint8_t> data);
 
     [[nodiscard]] const Curve25519PublicKey& public_key() const { return public_key_; }
+    [[nodiscard]] std::span<const uint8_t> as_bytes() const { return data_; }
 
     // Perform X25519 Diffie-Hellman
     [[nodiscard]] std::expected<std::array<uint8_t, SIZE>, KeyError>

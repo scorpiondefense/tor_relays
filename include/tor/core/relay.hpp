@@ -3,6 +3,7 @@
 #include "tor/core/cell.hpp"
 #include "tor/core/channel.hpp"
 #include "tor/core/circuit.hpp"
+#include "tor/crypto/key_store.hpp"
 #include "tor/modes/relay_behavior.hpp"
 #include <cstdint>
 #include <expected>
@@ -82,6 +83,16 @@ public:
         return behavior_.get();
     }
 
+    // Get relay keys (nullptr if not yet started)
+    [[nodiscard]] const crypto::RelayKeyPair* keys() const {
+        return keys_.get();
+    }
+
+    // Get relay fingerprint (empty NodeId if not yet started)
+    [[nodiscard]] const crypto::NodeId& fingerprint() const {
+        return fingerprint_;
+    }
+
 private:
     friend class RelayBuilder;
 
@@ -91,6 +102,8 @@ private:
 
     std::shared_ptr<ChannelManager> channel_manager_;
     std::unique_ptr<modes::RelayBehavior> behavior_;
+    std::unique_ptr<crypto::RelayKeyPair> keys_;
+    crypto::NodeId fingerprint_;
 
     struct Impl;
     std::unique_ptr<Impl> impl_;

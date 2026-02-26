@@ -1,4 +1,6 @@
 #include "tor/modes/middle_relay.hpp"
+#include "tor/modes/bridge_relay.hpp"
+#include "tor/modes/exit_relay.hpp"
 #include "tor/modes/guard_relay.hpp"
 #include "tor/util/config.hpp"
 
@@ -154,11 +156,9 @@ std::unique_ptr<RelayBehavior> create_behavior(RelayMode mode, const ::tor::util
         case RelayMode::Middle:
             return std::make_unique<MiddleRelay>(config);
         case RelayMode::Exit:
-            // return std::make_unique<ExitRelay>(config);
-            return std::make_unique<MiddleRelay>(config); // Fallback for now
+            return std::make_unique<ExitRelay>(config);
         case RelayMode::Bridge:
-            // return std::make_unique<BridgeRelay>(config);
-            return std::make_unique<MiddleRelay>(config); // Fallback for now
+            return std::make_unique<BridgeRelay>(config);
         case RelayMode::Guard:
             return std::make_unique<GuardRelay>(config);
         default:

@@ -50,6 +50,7 @@ set(TOR_SOURCES
     src/core/channel.cpp
     src/core/relay.cpp
     src/crypto/keys.cpp
+    src/crypto/key_store.cpp
     src/crypto/ntor.cpp
     src/crypto/aes_ctr.cpp
     src/crypto/hash.cpp
@@ -119,6 +120,7 @@ if(BUILD_TESTING)
         tests/unit/test_exit_policy.cpp
         tests/unit/test_config.cpp
         tests/unit/test_guard_relay.cpp
+        tests/unit/test_key_store.cpp
         tests/integration/test_tls.cpp
         tests/integration/test_circuit_creation.cpp
         tests/integration/test_directory.cpp

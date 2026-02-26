@@ -1,4 +1,6 @@
 #include "tor/core/relay.hpp"
+#include "tor/crypto/key_store.hpp"
+#include "tor/modes/bridge_relay.hpp"
 #include "tor/net/acceptor.hpp"
 #include "tor/util/config.hpp"
 #include "tor/util/logging.hpp"
@@ -42,6 +44,39 @@ std::expected<void, RelayError> Relay::start() {
     behavior_ = modes::create_behavior(config_->relay.mode, config_);
     if (!behavior_) {
         return std::unexpected(RelayError::InternalError);
+    }
+
+    // Load or generate identity keys
+    if (!config_->relay.data_dir.empty()) {
+        crypto::KeyStore key_store(config_->relay.data_dir);
+
+        auto keys_result = key_store.load_or_generate();
+        if (!keys_result) {
+            LOG_ERROR("Failed to load/generate keys: {}",
+                      crypto::key_store_error_message(keys_result.error()));
+            return std::unexpected(RelayError::KeyGenerationFailed);
+        }
+
+        fingerprint_ = crypto::NodeId(keys_result->identity_key.public_key());
+
+        auto fp_result = key_store.write_fingerprint(
+            config_->relay.nickname, fingerprint_);
+        if (!fp_result) {
+            LOG_WARN("Failed to write fingerprint file: {}",
+                     crypto::key_store_error_message(fp_result.error()));
+        }
+
+        LOG_INFO("Relay fingerprint: {}", fingerprint_.to_hex());
+
+        // Log bridge line for bridge mode
+        if (config_->relay.mode == modes::RelayMode::Bridge) {
+            auto* bridge = dynamic_cast<modes::BridgeRelay*>(behavior_.get());
+            if (bridge) {
+                LOG_INFO("Bridge line: {}", bridge->bridge_line());
+            }
+        }
+
+        keys_ = std::make_unique<crypto::RelayKeyPair>(std::move(*keys_result));
     }
 
     // Initialize networking
