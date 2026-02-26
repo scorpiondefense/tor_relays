@@ -28,15 +28,8 @@ class TorRelaysConan(ConanFile):
     def configure(self):
         self.options["openssl/*"].shared = False
         self.options["boost/*"].shared = False
-        self.options["boost/*"].without_locale = True
-        self.options["boost/*"].without_log = True
-        self.options["boost/*"].without_stacktrace = True
-        self.options["boost/*"].without_fiber = True
-        self.options["boost/*"].without_graph = True
-        self.options["boost/*"].without_graph_parallel = True
-        self.options["boost/*"].without_mpi = True
-        self.options["boost/*"].without_python = True
-        self.options["boost/*"].without_wave = True
+        # Only need headers (Asio) — disable all compiled libraries
+        self.options["boost/*"].header_only = True
 
     def layout(self):
         cmake_layout(self)
