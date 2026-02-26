@@ -1,14 +1,17 @@
 #include "tor/core/relay.hpp"
+#include "tor/net/acceptor.hpp"
 #include "tor/util/config.hpp"
 #include "tor/util/logging.hpp"
+#include <thread>
 
 namespace tor::core {
 
 // --- Relay implementation details ---
 
 struct Relay::Impl {
-    // Internal state for the relay (io_context, acceptor, etc.)
-    // Would contain boost::asio::io_context, TLS context, acceptor, etc.
+    boost::asio::io_context io_context;
+    std::unique_ptr<net::TcpAcceptor> acceptor;
+    std::jthread io_thread;
 };
 
 // --- Relay ---
@@ -41,12 +44,24 @@ std::expected<void, RelayError> Relay::start() {
         return std::unexpected(RelayError::InternalError);
     }
 
-    // In a full implementation:
-    // 1. Generate or load relay keys
-    // 2. Initialize TLS context with self-signed cert
-    // 3. Start TLS acceptor on OR port
-    // 4. Publish server descriptor to directory authorities
-    // 5. Start periodic tasks (descriptor refresh, bandwidth accounting)
+    // Initialize networking
+    impl_ = std::make_unique<Impl>();
+    impl_->acceptor = std::make_unique<net::TcpAcceptor>(impl_->io_context);
+
+    auto listen_result = impl_->acceptor->listen("0.0.0.0", config_->relay.or_port);
+    if (!listen_result) {
+        return std::unexpected(RelayError::BindFailed);
+    }
+
+    // Start accept loop in background thread
+    impl_->acceptor->start_accept_loop([](auto /*result*/) {
+        // Connection handling will be implemented as protocol layers mature
+    });
+
+    impl_->io_thread = std::jthread([this](std::stop_token) {
+        auto work_guard = boost::asio::make_work_guard(impl_->io_context);
+        impl_->io_context.run();
+    });
 
     running_ = true;
     return {};
@@ -55,6 +70,17 @@ std::expected<void, RelayError> Relay::start() {
 std::expected<void, RelayError> Relay::stop() {
     if (!running_) {
         return std::unexpected(RelayError::NotRunning);
+    }
+
+    // Stop acceptor and io_context
+    if (impl_) {
+        if (impl_->acceptor) {
+            impl_->acceptor->close();
+        }
+        impl_->io_context.stop();
+        if (impl_->io_thread.joinable()) {
+            impl_->io_thread.join();
+        }
     }
 
     // Close all channels
