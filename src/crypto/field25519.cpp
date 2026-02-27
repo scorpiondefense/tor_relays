@@ -4,7 +4,10 @@
 namespace tor::crypto {
 
 using u64 = uint64_t;
-using u128 = __extension__ unsigned __int128;
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
+using u128 = unsigned __int128;
+#pragma GCC diagnostic pop
 
 static constexpr u64 MASK51 = FieldElement::MASK51;
 
