@@ -12,7 +12,14 @@ Obfs4Listener::Obfs4Listener(
     : io_context_(io_context)
     , node_id_(node_id)
     , identity_key_(identity_key)
-    , iat_mode_(iat_mode) {}
+    , iat_mode_(iat_mode)
+{
+    // Pre-compute the obfs4 cert at construction time
+    Obfs4Identity identity;
+    identity.node_id = node_id_;
+    identity.ntor_public_key = identity_key_.public_key();
+    cert_ = identity.to_cert();
+}
 
 Obfs4Listener::~Obfs4Listener() {
     stop();
@@ -32,6 +39,7 @@ Obfs4Listener::start(const std::string& address, uint16_t port) {
     }
 
     LOG_INFO("obfs4 listener started on {}:{}", address, port);
+    LOG_INFO("obfs4 cert: {}", cert_);
 
     // Start accept loop
     acceptor_->start_accept_loop([this](auto result) {
@@ -56,13 +64,6 @@ void Obfs4Listener::stop() {
 
     listening_ = false;
     LOG_INFO("obfs4 listener stopped");
-}
-
-std::string Obfs4Listener::cert() const {
-    Obfs4Identity identity;
-    identity.node_id = node_id_;
-    identity.ntor_public_key = identity_key_.public_key();
-    return identity.to_cert();
 }
 
 void Obfs4Listener::handle_connection(std::shared_ptr<net::TcpConnection> conn) {

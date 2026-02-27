@@ -44,7 +44,7 @@ public:
     void stop();
 
     // Get the obfs4 cert for bridge line generation
-    [[nodiscard]] std::string cert() const;
+    [[nodiscard]] const std::string& cert() const { return cert_; }
 
     // Set the local OR port to proxy to (default: 9001)
     void set_or_port(uint16_t port) { or_port_ = port; }
@@ -64,9 +64,10 @@ public:
 
 private:
     boost::asio::io_context& io_context_;
-    const crypto::NodeId& node_id_;
+    crypto::NodeId node_id_;
     const crypto::Curve25519SecretKey& identity_key_;
     IatMode iat_mode_;
+    std::string cert_;
 
     std::unique_ptr<net::TcpAcceptor> acceptor_;
     uint16_t or_port_{9001};
