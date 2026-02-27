@@ -66,20 +66,16 @@ std::string Obfs4Listener::cert() const {
 }
 
 void Obfs4Listener::handle_connection(std::shared_ptr<net::TcpConnection> conn) {
-    // Perform obfs4 handshake asynchronously
     auto handshake = std::make_shared<Obfs4ServerHandshake>(node_id_, identity_key_);
 
-    // Read data in a loop until handshake completes
-    // Use the io_context to post async work
-    auto self_stats_completed = &handshakes_completed_;
-    auto self_stats_failed = &handshakes_failed_;
-    auto self_or_port = or_port_;
-    auto& self_io = io_context_;
+    auto stats_completed = &handshakes_completed_;
+    auto stats_failed = &handshakes_failed_;
+    auto local_or_port = or_port_;
+    auto& io = io_context_;
 
-    // Buffer for reading handshake data
     auto buffer = std::make_shared<std::array<uint8_t, 4096>>();
 
-    // Recursive lambda for async handshake reads
+    // Handshake state machine: read -> consume -> check state -> loop or finish
     struct HandshakeReader : std::enable_shared_from_this<HandshakeReader> {
         std::shared_ptr<net::TcpConnection> conn;
         std::shared_ptr<Obfs4ServerHandshake> handshake;
@@ -87,23 +83,24 @@ void Obfs4Listener::handle_connection(std::shared_ptr<net::TcpConnection> conn) 
         std::atomic<uint64_t>* completed;
         std::atomic<uint64_t>* failed;
         uint16_t or_port;
-        boost::asio::io_context& io_ctx;
+        boost::asio::io_context* io_ctx;
 
         void start() {
             read_more();
         }
 
         void read_more() {
-            auto read_result = conn->read(
+            auto bytes_read = conn->read(
                 std::span<uint8_t>(buffer->data(), buffer->size()));
 
-            if (!read_result || read_result->empty()) {
+            if (!bytes_read || *bytes_read == 0) {
                 LOG_DEBUG("obfs4 handshake: connection closed during read");
                 failed->fetch_add(1, std::memory_order_relaxed);
                 return;
             }
 
-            auto consume_result = handshake->consume(*read_result);
+            auto data = std::span<const uint8_t>(buffer->data(), *bytes_read);
+            auto consume_result = handshake->consume(data);
             if (!consume_result) {
                 LOG_DEBUG("obfs4 handshake failed: {}",
                          obfs4_error_message(consume_result.error()));
@@ -112,7 +109,6 @@ void Obfs4Listener::handle_connection(std::shared_ptr<net::TcpConnection> conn) 
             }
 
             if (handshake->state() == Obfs4ServerHandshake::State::Completed) {
-                // Generate and send server hello
                 auto hello = handshake->generate_server_hello();
                 if (!hello) {
                     LOG_ERROR("obfs4: failed to generate server hello");
@@ -120,7 +116,8 @@ void Obfs4Listener::handle_connection(std::shared_ptr<net::TcpConnection> conn) 
                     return;
                 }
 
-                auto write_result = conn->write(*hello);
+                auto hello_span = std::span<const uint8_t>(hello->data(), hello->size());
+                auto write_result = conn->write(hello_span);
                 if (!write_result) {
                     LOG_ERROR("obfs4: failed to send server hello");
                     failed->fetch_add(1, std::memory_order_relaxed);
@@ -132,27 +129,23 @@ void Obfs4Listener::handle_connection(std::shared_ptr<net::TcpConnection> conn) 
 
                 // Set up framing with session keys
                 auto framing = std::make_unique<Obfs4Framing>();
-                auto& keys = handshake->session_keys();
+                const auto& keys = handshake->session_keys();
                 framing->init_send(keys.send_key, keys.send_nonce);
                 framing->init_recv(keys.recv_key, keys.recv_nonce);
 
                 // Connect to local OR port and start proxying
-                auto or_conn = std::make_shared<net::TcpConnection>(io_ctx);
+                auto or_conn = std::make_shared<net::TcpConnection>(*io_ctx);
                 auto connect_result = or_conn->connect("127.0.0.1", or_port);
                 if (!connect_result) {
                     LOG_ERROR("obfs4: failed to connect to local OR port {}", or_port);
                     return;
                 }
 
-                // Start bidirectional proxy
-                // obfs4 -> decrypt -> OR port
-                // OR port -> encrypt -> obfs4
                 proxy_loop(conn, or_conn, std::move(framing));
             } else if (handshake->state() == Obfs4ServerHandshake::State::Failed) {
                 failed->fetch_add(1, std::memory_order_relaxed);
                 return;
             } else {
-                // Need more data
                 read_more();
             }
         }
@@ -165,68 +158,61 @@ void Obfs4Listener::handle_connection(std::shared_ptr<net::TcpConnection> conn) 
             auto shared_framing = std::shared_ptr<Obfs4Framing>(std::move(framing));
             auto proxy_buf = std::make_shared<std::array<uint8_t, 4096>>();
 
-            // Simple synchronous proxy for now
-            // TODO: Use async I/O for production
             while (true) {
-                // Read from obfs4 connection
-                auto obfs4_data = obfs4_conn->read(
+                // Read encrypted data from obfs4 client
+                auto obfs4_read = obfs4_conn->read(
                     std::span<uint8_t>(proxy_buf->data(), proxy_buf->size()));
-                if (!obfs4_data || obfs4_data->empty()) {
+                if (!obfs4_read || *obfs4_read == 0) {
                     break;
                 }
 
                 // Decrypt frames
-                auto frames = shared_framing->decode(*obfs4_data);
+                auto encrypted = std::span<const uint8_t>(proxy_buf->data(), *obfs4_read);
+                auto frames = shared_framing->decode(encrypted);
                 if (!frames) {
                     LOG_DEBUG("obfs4: frame decryption failed");
                     break;
                 }
 
                 // Forward decrypted data to OR port
-                for (auto& frame : frames->frames) {
-                    auto write_result = or_conn->write(frame);
-                    if (!write_result) {
-                        break;
+                for (const auto& frame : frames->frames) {
+                    auto frame_span = std::span<const uint8_t>(frame.data(), frame.size());
+                    auto wr = or_conn->write(frame_span);
+                    if (!wr) {
+                        goto done;
                     }
                 }
 
-                // Read from OR port
-                auto or_data = or_conn->read(
+                // Read plaintext from OR port
+                auto or_read = or_conn->read(
                     std::span<uint8_t>(proxy_buf->data(), proxy_buf->size()));
-                if (or_data && !or_data->empty()) {
-                    // Encrypt and send back to obfs4 connection
-                    auto encoded = shared_framing->encode(*or_data);
-                    auto send_result = obfs4_conn->write(encoded);
-                    if (!send_result) {
+                if (or_read && *or_read > 0) {
+                    auto plaintext = std::span<const uint8_t>(proxy_buf->data(), *or_read);
+                    auto encoded = shared_framing->encode(plaintext);
+                    auto enc_span = std::span<const uint8_t>(encoded.data(), encoded.size());
+                    auto wr = obfs4_conn->write(enc_span);
+                    if (!wr) {
                         break;
                     }
                 }
             }
-
+done:
             obfs4_conn->close();
             or_conn->close();
         }
     };
 
-    auto reader = std::make_shared<HandshakeReader>();
-    reader->conn = conn;
-    reader->handshake = handshake;
-    reader->buffer = buffer;
-    reader->completed = self_stats_completed;
-    reader->failed = self_stats_failed;
-    reader->or_port = self_or_port;
-    reader->io_ctx = self_io;
+    auto reader = std::make_shared<HandshakeReader>(
+        HandshakeReader{conn, handshake, buffer,
+                        stats_completed, stats_failed, local_or_port, &io});
     reader->start();
 }
 
 void Obfs4Listener::proxy_connection(
-    std::shared_ptr<net::TcpConnection> obfs4_conn,
-    std::shared_ptr<net::TcpConnection> or_conn,
-    std::unique_ptr<Obfs4Framing> framing) {
+    [[maybe_unused]] std::shared_ptr<net::TcpConnection> obfs4_conn,
+    [[maybe_unused]] std::shared_ptr<net::TcpConnection> or_conn,
+    [[maybe_unused]] std::unique_ptr<Obfs4Framing> framing) {
     // Proxy logic is handled inside HandshakeReader::proxy_loop
-    (void)obfs4_conn;
-    (void)or_conn;
-    (void)framing;
 }
 
 }  // namespace tor::transport
