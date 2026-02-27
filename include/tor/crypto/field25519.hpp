@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <span>
+#include <utility>
 
 namespace tor::crypto {
 
@@ -51,13 +52,10 @@ public:
     // Modular inverse via Fermat's little theorem: a^(p-2) mod p
     [[nodiscard]] FieldElement invert() const;
 
-    // Square root: returns sqrt if it exists (a^((p+3)/8) with correction)
-    // Returns {sqrt, true} if square root exists, {0, false} otherwise
-    struct SqrtResult {
-        FieldElement value;
-        bool exists;
-    };
-    [[nodiscard]] SqrtResult sqrt() const;
+    // Square root: returns {sqrt, exists} pair.
+    // If exists==true, value is the square root. Otherwise value is zero.
+    // Uses std::pair to avoid incomplete-type issue with nested struct.
+    [[nodiscard]] std::pair<FieldElement, bool> sqrt() const;
 
     // Raise to power (p-5)/8 = 2^252-3
     [[nodiscard]] FieldElement pow_p58() const;

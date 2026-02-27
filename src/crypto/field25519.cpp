@@ -334,7 +334,7 @@ FieldElement FieldElement::pow_p58() const {
 
 // --- Square root ---
 
-FieldElement::SqrtResult FieldElement::sqrt() const {
+std::pair<FieldElement, bool> FieldElement::sqrt() const {
     // sqrt(a) for p = 5 (mod 8):
     // beta = a^((p+3)/8)
     // If beta^2 == a, return beta
