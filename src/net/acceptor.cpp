@@ -95,12 +95,14 @@ std::expected<std::shared_ptr<TcpConnection>, AcceptorError> TcpAcceptor::accept
     }
 
     try {
-        auto conn = std::make_shared<TcpConnection>(io_context_);
         boost::system::error_code ec;
-        acceptor_.accept(conn->socket(), ec);
+        tcp::socket socket(io_context_);
+        acceptor_.accept(socket, ec);
         if (ec) {
             return std::unexpected(AcceptorError::AcceptFailed);
         }
+        auto conn = std::make_shared<TcpConnection>(io_context_);
+        conn->accept(std::move(socket));
         return conn;
     } catch (...) {
         return std::unexpected(AcceptorError::AcceptFailed);
@@ -113,11 +115,13 @@ void TcpAcceptor::async_accept(AcceptHandler handler) {
         return;
     }
 
-    auto conn = std::make_shared<TcpConnection>(io_context_);
-    acceptor_.async_accept(conn->socket(), [conn, handler](boost::system::error_code ec) {
+    auto socket = std::make_shared<tcp::socket>(io_context_);
+    acceptor_.async_accept(*socket, [this, socket, handler](boost::system::error_code ec) {
         if (ec) {
             handler(std::unexpected(AcceptorError::AcceptFailed));
         } else {
+            auto conn = std::make_shared<TcpConnection>(io_context_);
+            conn->accept(std::move(*socket));
             handler(conn);
         }
     });
