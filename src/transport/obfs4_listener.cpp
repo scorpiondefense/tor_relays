@@ -133,11 +133,11 @@ void Obfs4Listener::handle_connection(std::shared_ptr<net::TcpConnection> conn) 
                 completed->fetch_add(1, std::memory_order_relaxed);
                 LOG_INFO("obfs4 handshake completed successfully");
 
-                // Set up framing with session keys
+                // Set up framing with session keys and DRBG seeds
                 auto framing = std::make_unique<Obfs4Framing>();
                 const auto& keys = handshake->session_keys();
-                framing->init_send(keys.send_key, keys.send_nonce);
-                framing->init_recv(keys.recv_key, keys.recv_nonce);
+                framing->init_send(keys.send_key, keys.send_nonce, keys.send_drbg_seed);
+                framing->init_recv(keys.recv_key, keys.recv_nonce, keys.recv_drbg_seed);
 
                 // Connect to local OR port and start proxying
                 auto or_conn = std::make_shared<net::TcpConnection>(*io_ctx);

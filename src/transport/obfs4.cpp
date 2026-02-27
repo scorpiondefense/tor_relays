@@ -15,13 +15,13 @@ static constexpr const char T_MAC[] = "ntor-curve25519-sha256-1:mac";
 static constexpr size_t T_MAC_LEN = 28;
 
 static constexpr const char T_KEY[] = "ntor-curve25519-sha256-1:key_extract";
-static constexpr size_t T_KEY_LEN = 37;
+static constexpr size_t T_KEY_LEN = 36; // strlen, NOT sizeof (no null byte)
 
 static constexpr const char T_VERIFY[] = "ntor-curve25519-sha256-1:key_verify";
-static constexpr size_t T_VERIFY_LEN = 36;
+static constexpr size_t T_VERIFY_LEN = 35; // strlen, NOT sizeof (no null byte)
 
 static constexpr const char M_EXPAND[] = "ntor-curve25519-sha256-1:key_expand";
-static constexpr size_t M_EXPAND_LEN = 36;
+static constexpr size_t M_EXPAND_LEN = 35; // strlen, NOT sizeof (no null byte)
 
 // --- Utility ---
 
@@ -235,8 +235,12 @@ Obfs4ServerHandshake::consume(std::span<const uint8_t> data) {
             return std::unexpected(Obfs4Error::HandshakeFailed);
         }
 
-        // Server ephemeral public key (Y)
-        auto server_eph_pub = eph_sk->public_key();
+        // Server ephemeral public key (Y) — must use the Elligator2-derived
+        // public key (from scalar_base_mult), NOT OpenSSL's public key.
+        // The client recovers Y from our representative via representative_to_point(),
+        // which returns the scalar_base_mult result. Using OpenSSL's public key here
+        // would cause an AUTH mismatch if the two derivations differ.
+        auto server_eph_pub = crypto::Curve25519PublicKey(server_ephemeral_->public_key);
 
         // Derive ntor keys: KEY_SEED, verify, auth, session keys
         derive_keys(*exp_eph, *exp_id,
@@ -467,24 +471,26 @@ void Obfs4ServerHandshake::derive_keys(
     // okm[72:144] = client decoder key / server encoder key
     //
     // Each 72-byte block: secretbox_key[32] | nonce_prefix[16] | drbg_seed[24]
-    // For now, map into current SessionKeys format (32-byte key + 24-byte nonce)
 
     // Server recv (client encoder) = okm[0:72]
     std::memcpy(session_keys_.recv_key.data(), km.data(), 32);
     // Build recv nonce: prefix[16] || counter[8] with counter=1
     std::array<uint8_t, 24> recv_nonce{};
     std::memcpy(recv_nonce.data(), km.data() + 32, 16);
-    // Counter starts at 1 (big-endian)
-    recv_nonce[23] = 1;
+    recv_nonce[23] = 1; // Counter starts at 1 (big-endian)
     std::memcpy(session_keys_.recv_nonce.data(), recv_nonce.data(), 24);
+    // DRBG seed for recv direction: okm[48:72]
+    std::memcpy(session_keys_.recv_drbg_seed.data(), km.data() + 48, 24);
 
     // Server send (client decoder) = okm[72:144]
     std::memcpy(session_keys_.send_key.data(), km.data() + 72, 32);
     // Build send nonce: prefix[16] || counter[8] with counter=1
     std::array<uint8_t, 24> send_nonce{};
     std::memcpy(send_nonce.data(), km.data() + 72 + 32, 16);
-    send_nonce[23] = 1;
+    send_nonce[23] = 1; // Counter starts at 1 (big-endian)
     std::memcpy(session_keys_.send_nonce.data(), send_nonce.data(), 24);
+    // DRBG seed for send direction: okm[120:144]
+    std::memcpy(session_keys_.send_drbg_seed.data(), km.data() + 72 + 48, 24);
 
     // Wipe sensitive data
     std::memset(secret_input.data(), 0, secret_input.size());
@@ -544,19 +550,118 @@ Obfs4ServerHandshake::generate_server_hello() {
     return hello;
 }
 
+// --- SipHash-2-4 ---
+
+namespace {
+
+inline uint64_t rotl64(uint64_t v, int n) {
+    return (v << n) | (v >> (64 - n));
+}
+
+inline void sipround(uint64_t& v0, uint64_t& v1, uint64_t& v2, uint64_t& v3) {
+    v0 += v1; v1 = rotl64(v1, 13); v1 ^= v0; v0 = rotl64(v0, 32);
+    v2 += v3; v3 = rotl64(v3, 16); v3 ^= v2;
+    v0 += v3; v3 = rotl64(v3, 21); v3 ^= v0;
+    v2 += v1; v1 = rotl64(v1, 17); v1 ^= v2; v2 = rotl64(v2, 32);
+}
+
+inline uint64_t le64(const uint8_t* p) {
+    return static_cast<uint64_t>(p[0])
+         | (static_cast<uint64_t>(p[1]) << 8)
+         | (static_cast<uint64_t>(p[2]) << 16)
+         | (static_cast<uint64_t>(p[3]) << 24)
+         | (static_cast<uint64_t>(p[4]) << 32)
+         | (static_cast<uint64_t>(p[5]) << 40)
+         | (static_cast<uint64_t>(p[6]) << 48)
+         | (static_cast<uint64_t>(p[7]) << 56);
+}
+
+inline void put_le64(uint8_t* p, uint64_t v) {
+    p[0] = static_cast<uint8_t>(v);
+    p[1] = static_cast<uint8_t>(v >> 8);
+    p[2] = static_cast<uint8_t>(v >> 16);
+    p[3] = static_cast<uint8_t>(v >> 24);
+    p[4] = static_cast<uint8_t>(v >> 32);
+    p[5] = static_cast<uint8_t>(v >> 40);
+    p[6] = static_cast<uint8_t>(v >> 48);
+    p[7] = static_cast<uint8_t>(v >> 56);
+}
+
+// SipHash-2-4: hash an 8-byte message with a 16-byte key, producing 8 bytes
+uint64_t siphash_2_4(const uint8_t key[16], const uint8_t msg[8]) {
+    uint64_t k0 = le64(key);
+    uint64_t k1 = le64(key + 8);
+
+    uint64_t v0 = k0 ^ 0x736f6d6570736575ULL;
+    uint64_t v1 = k1 ^ 0x646f72616e646f6dULL;
+    uint64_t v2 = k0 ^ 0x6c7967656e657261ULL;
+    uint64_t v3 = k1 ^ 0x7465646279746573ULL;
+
+    // Process single 8-byte block
+    uint64_t m = le64(msg);
+    v3 ^= m;
+    sipround(v0, v1, v2, v3);
+    sipround(v0, v1, v2, v3);
+    v0 ^= m;
+
+    // Finalization: length byte (8) in high byte of last block
+    uint64_t b = static_cast<uint64_t>(8) << 56;
+    v3 ^= b;
+    sipround(v0, v1, v2, v3);
+    sipround(v0, v1, v2, v3);
+    v0 ^= b;
+
+    v2 ^= 0xff;
+    sipround(v0, v1, v2, v3);
+    sipround(v0, v1, v2, v3);
+    sipround(v0, v1, v2, v3);
+    sipround(v0, v1, v2, v3);
+
+    return v0 ^ v1 ^ v2 ^ v3;
+}
+
+} // anonymous namespace
+
+// --- Obfs4Drbg ---
+
+void Obfs4Drbg::init(std::span<const uint8_t, 24> seed) {
+    std::memcpy(key_.data(), seed.data(), 16);
+    std::memcpy(ofb_.data(), seed.data() + 16, 8);
+    initialized_ = true;
+}
+
+std::array<uint8_t, 8> Obfs4Drbg::next_block() {
+    // OFB mode: ofb = SipHash-2-4(key, ofb)
+    uint64_t output = siphash_2_4(key_.data(), ofb_.data());
+    put_le64(ofb_.data(), output);
+
+    std::array<uint8_t, 8> result;
+    put_le64(result.data(), output);
+    return result;
+}
+
+uint16_t Obfs4Drbg::next_length_mask() {
+    auto block = next_block();
+    return static_cast<uint16_t>(block[0]) << 8 | static_cast<uint16_t>(block[1]);
+}
+
 // --- Obfs4Framing ---
 
 void Obfs4Framing::init_send(std::span<const uint8_t, 32> key,
-                              std::span<const uint8_t, 24> initial_nonce) {
+                              std::span<const uint8_t, 24> initial_nonce,
+                              std::span<const uint8_t, 24> drbg_seed) {
     std::memcpy(send_key_.data(), key.data(), 32);
     std::memcpy(send_nonce_.data(), initial_nonce.data(), 24);
+    send_drbg_.init(drbg_seed);
     send_initialized_ = true;
 }
 
 void Obfs4Framing::init_recv(std::span<const uint8_t, 32> key,
-                              std::span<const uint8_t, 24> initial_nonce) {
+                              std::span<const uint8_t, 24> initial_nonce,
+                              std::span<const uint8_t, 24> drbg_seed) {
     std::memcpy(recv_key_.data(), key.data(), 32);
     std::memcpy(recv_nonce_.data(), initial_nonce.data(), 24);
+    recv_drbg_.init(drbg_seed);
     recv_initialized_ = true;
 }
 
@@ -569,27 +674,27 @@ void Obfs4Framing::increment_nonce(std::array<uint8_t, 24>& nonce) {
 }
 
 std::vector<uint8_t> Obfs4Framing::encode(std::span<const uint8_t> payload) {
-    // Frame format:
-    // secretbox_seal(length[2]) || secretbox_seal(payload)
-    // where length is big-endian uint16
-    // NOTE: Real obfs4 uses SipHash XOR for length, not secretbox.
-    // This will be fixed in a follow-up commit.
-
-    std::vector<uint8_t> output;
+    // Frame format per obfs4 spec:
+    // obfuscated_length[2] || secretbox_seal(payload)
+    //
+    // obfuscated_length = payload_len XOR drbg.next_length_mask()
+    // secretbox uses one nonce per frame (incremented after payload seal)
 
     uint16_t len = static_cast<uint16_t>(payload.size());
-    std::array<uint8_t, 2> len_bytes = {
-        static_cast<uint8_t>(len >> 8),
-        static_cast<uint8_t>(len & 0xff)
-    };
+    uint16_t mask = send_drbg_.next_length_mask();
+    uint16_t obfuscated = len ^ mask;
 
-    auto sealed_len = crypto::Secretbox::seal(send_key_, send_nonce_, len_bytes);
-    increment_nonce(send_nonce_);
+    std::vector<uint8_t> output;
+    output.reserve(2 + payload.size() + crypto::Secretbox::OVERHEAD);
 
+    // 1. Obfuscated length (2 bytes, big-endian)
+    output.push_back(static_cast<uint8_t>(obfuscated >> 8));
+    output.push_back(static_cast<uint8_t>(obfuscated & 0xff));
+
+    // 2. Secretbox-sealed payload
     auto sealed_payload = crypto::Secretbox::seal(send_key_, send_nonce_, payload);
     increment_nonce(send_nonce_);
 
-    output.insert(output.end(), sealed_len.begin(), sealed_len.end());
     output.insert(output.end(), sealed_payload.begin(), sealed_payload.end());
 
     return output;
@@ -604,28 +709,25 @@ Obfs4Framing::decode(std::span<const uint8_t> data) {
 
     while (true) {
         if (!pending_payload_len_) {
-            constexpr size_t SEALED_LEN_SIZE = 2 + crypto::Secretbox::OVERHEAD;
-            if (recv_buffer_.size() < SEALED_LEN_SIZE) {
+            // Need 2 bytes for the obfuscated length
+            if (recv_buffer_.size() < OBFS4_FRAME_HDR_LEN) {
                 break;
             }
 
-            auto len_ct = std::span<const uint8_t>(recv_buffer_.data(), SEALED_LEN_SIZE);
-            auto len_pt = crypto::Secretbox::open(recv_key_, recv_nonce_, len_ct);
-            if (!len_pt) {
-                return std::unexpected(Obfs4Error::FrameDecryptFailed);
-            }
-            increment_nonce(recv_nonce_);
+            // Deobfuscate length: XOR with DRBG output
+            uint16_t obfuscated = (static_cast<uint16_t>(recv_buffer_[0]) << 8) |
+                                   static_cast<uint16_t>(recv_buffer_[1]);
+            uint16_t mask = recv_drbg_.next_length_mask();
+            uint16_t payload_len = obfuscated ^ mask;
 
-            uint16_t payload_len = (static_cast<uint16_t>((*len_pt)[0]) << 8) |
-                                    static_cast<uint16_t>((*len_pt)[1]);
             if (payload_len > OBFS4_MAX_FRAME_PAYLOAD) {
                 return std::unexpected(Obfs4Error::FrameTooLarge);
             }
 
             pending_payload_len_ = payload_len;
             recv_buffer_.erase(recv_buffer_.begin(),
-                              recv_buffer_.begin() + SEALED_LEN_SIZE);
-            result.consumed += SEALED_LEN_SIZE;
+                              recv_buffer_.begin() + OBFS4_FRAME_HDR_LEN);
+            result.consumed += OBFS4_FRAME_HDR_LEN;
         }
 
         size_t sealed_payload_size = *pending_payload_len_ + crypto::Secretbox::OVERHEAD;
