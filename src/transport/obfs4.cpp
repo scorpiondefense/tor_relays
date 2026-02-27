@@ -684,18 +684,17 @@ std::vector<uint8_t> Obfs4Framing::encode(std::span<const uint8_t> payload) {
     uint16_t mask = send_drbg_.next_length_mask();
     uint16_t obfuscated = len ^ mask;
 
-    std::vector<uint8_t> output;
-    output.reserve(2 + payload.size() + crypto::Secretbox::OVERHEAD);
-
-    // 1. Obfuscated length (2 bytes, big-endian)
-    output.push_back(static_cast<uint8_t>(obfuscated >> 8));
-    output.push_back(static_cast<uint8_t>(obfuscated & 0xff));
-
-    // 2. Secretbox-sealed payload
+    // 1. Seal the payload first
     auto sealed_payload = crypto::Secretbox::seal(send_key_, send_nonce_, payload);
     increment_nonce(send_nonce_);
 
-    output.insert(output.end(), sealed_payload.begin(), sealed_payload.end());
+    // 2. Build output: obfuscated_length[2] || sealed_payload
+    // Use memcpy to avoid GCC -Werror=free-nonheap-object false positive
+    size_t total = 2 + sealed_payload.size();
+    std::vector<uint8_t> output(total);
+    output[0] = static_cast<uint8_t>(obfuscated >> 8);
+    output[1] = static_cast<uint8_t>(obfuscated & 0xff);
+    std::memcpy(output.data() + 2, sealed_payload.data(), sealed_payload.size());
 
     return output;
 }
