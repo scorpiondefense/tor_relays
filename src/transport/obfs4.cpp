@@ -393,37 +393,31 @@ void Obfs4ServerHandshake::derive_keys(
     //   PROTOID = "ntor-curve25519-sha256-1"
     //   ID = node ID (20 bytes)
 
-    std::vector<uint8_t> secret_input;
-    secret_input.reserve(32 + 32 + 32 + 32 + 32 + 32 + PROTO_ID_LEN + 20); // 236 bytes
+    // Build secret_input using memcpy to avoid GCC -Werror=array-bounds false positive
+    constexpr size_t SECRET_INPUT_LEN = 32 + 32 + 32 + 32 + 32 + 32 + PROTO_ID_LEN + 20; // 236
+    std::vector<uint8_t> secret_input(SECRET_INPUT_LEN);
+    size_t off = 0;
 
     // EXP1: DH(server_eph, client)
-    secret_input.insert(secret_input.end(), exp_eph.begin(), exp_eph.end());
+    std::memcpy(secret_input.data() + off, exp_eph.data(), 32); off += 32;
     // EXP2: DH(server_identity, client)
-    secret_input.insert(secret_input.end(), exp_id.begin(), exp_id.end());
+    std::memcpy(secret_input.data() + off, exp_id.data(), 32); off += 32;
     // B (server identity pub) — first copy
-    secret_input.insert(secret_input.end(),
-                        server_identity_pub.data().begin(), server_identity_pub.data().end());
+    std::memcpy(secret_input.data() + off, server_identity_pub.data().data(), 32); off += 32;
     // B (server identity pub) — second copy
-    secret_input.insert(secret_input.end(),
-                        server_identity_pub.data().begin(), server_identity_pub.data().end());
+    std::memcpy(secret_input.data() + off, server_identity_pub.data().data(), 32); off += 32;
     // X (client ephemeral pub)
-    secret_input.insert(secret_input.end(),
-                        client_pub.data().begin(), client_pub.data().end());
+    std::memcpy(secret_input.data() + off, client_pub.data().data(), 32); off += 32;
     // Y (server ephemeral pub)
-    secret_input.insert(secret_input.end(),
-                        server_eph_pub.data().begin(), server_eph_pub.data().end());
+    std::memcpy(secret_input.data() + off, server_eph_pub.data().data(), 32); off += 32;
     // PROTOID
-    secret_input.insert(secret_input.end(),
-                        reinterpret_cast<const uint8_t*>(PROTO_ID),
-                        reinterpret_cast<const uint8_t*>(PROTO_ID) + PROTO_ID_LEN);
+    std::memcpy(secret_input.data() + off, PROTO_ID, PROTO_ID_LEN); off += PROTO_ID_LEN;
     // ID (node ID, 20 bytes)
-    secret_input.insert(secret_input.end(),
-                        node_id_.data().begin(), node_id_.data().end());
+    std::memcpy(secret_input.data() + off, node_id_.data().data(), 20);
 
-    // Build suffix = B | B | X | Y | PROTOID | ID (reused for auth_input)
-    // suffix starts at offset 64 in secret_input (after the two 32-byte exponents)
-    auto suffix_begin = secret_input.begin() + 64;
-    auto suffix_end = secret_input.end();
+    // Suffix = B | B | X | Y | PROTOID | ID starts at offset 64 in secret_input
+    constexpr size_t SUFFIX_OFFSET = 64;
+    constexpr size_t SUFFIX_LEN = SECRET_INPUT_LEN - SUFFIX_OFFSET; // 172 bytes
 
     // Step 1: KEY_SEED = HMAC-SHA256(key=t_key, message=secret_input)
     auto t_key_span = std::span<const uint8_t>(
@@ -441,13 +435,14 @@ void Obfs4ServerHandshake::derive_keys(
     auto t_mac_span = std::span<const uint8_t>(
         reinterpret_cast<const uint8_t*>(T_MAC), T_MAC_LEN);
 
-    std::vector<uint8_t> auth_input;
-    auth_input.insert(auth_input.end(), verify->begin(), verify->end());
-    auth_input.insert(auth_input.end(), suffix_begin, suffix_end);
+    // Build auth_input = verify[32] | suffix[172] | "Server"[6] = 210 bytes
+    constexpr size_t AUTH_INPUT_LEN = 32 + SUFFIX_LEN + 6; // 210
+    std::vector<uint8_t> auth_input(AUTH_INPUT_LEN);
+    size_t aoff = 0;
+    std::memcpy(auth_input.data() + aoff, verify->data(), 32); aoff += 32;
+    std::memcpy(auth_input.data() + aoff, secret_input.data() + SUFFIX_OFFSET, SUFFIX_LEN); aoff += SUFFIX_LEN;
     static constexpr const char SERVER_STR[] = "Server";
-    auth_input.insert(auth_input.end(),
-                      reinterpret_cast<const uint8_t*>(SERVER_STR),
-                      reinterpret_cast<const uint8_t*>(SERVER_STR) + 6);
+    std::memcpy(auth_input.data() + aoff, SERVER_STR, 6);
 
     auto auth_result = crypto::hmac_sha256(t_mac_span, auth_input);
     if (!auth_result) return;
