@@ -231,7 +231,7 @@ void poly1305(
     std::span<const uint8_t> message,
     std::span<const uint8_t, 32> key) {
 
-    using u128 = unsigned __int128;
+    using u128 = __extension__ unsigned __int128;
 
     // Clamp r (first 16 bytes of key)
     uint32_t r0 = load32_le(key.data())      & 0x0fffffff;

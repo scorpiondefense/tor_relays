@@ -4,7 +4,7 @@
 namespace tor::crypto {
 
 using u64 = uint64_t;
-using u128 = unsigned __int128;
+using u128 = __extension__ unsigned __int128;
 
 static constexpr u64 MASK51 = FieldElement::MASK51;
 
@@ -14,7 +14,7 @@ static constexpr u64 MASK51 = FieldElement::MASK51;
 // --- Serialization ---
 
 FieldElement FieldElement::from_bytes(std::span<const uint8_t, 32> bytes) {
-    u64 load64le = [](const uint8_t* p) -> u64 {
+    auto load64le = [](const uint8_t* p) -> u64 {
         u64 r = 0;
         for (int i = 7; i >= 0; --i)
             r = (r << 8) | p[i];
@@ -194,23 +194,6 @@ FieldElement& FieldElement::operator*=(const FieldElement& rhs) {
 FieldElement FieldElement::square() const {
     const u64* a = limbs_;
 
-    u64 a0_2 = a[0] * 2;
-    u64 a1_2 = a[1] * 2;
-    u64 a2_2 = a[2] * 2;
-    u64 a3_2 = a[3] * 2;
-    u64 a1_38 = a[1] * 38;
-    u64 a2_38 = a[2] * 38;
-    u64 a3_38 = a[3] * 38;
-    u64 a4_19 = a[4] * 19;
-
-    u128 t0 = (u128)a[0] * a[0] + (u128)a3_2 * a2_38 + (u128)a1_2 * (a4_19);
-    u128 t1 = (u128)a0_2 * a[1] + (u128)a3_2 * (a3_38 / 2) + (u128)a2_2 * (a4_19);
-    // Fix: a3_38/2 loses precision. Recalculate:
-    // t1 = 2*a0*a1 + a3^2*19 + 2*a2*a4*19
-    // But let's use the correct schoolbook formula
-
-    // Redo squaring properly:
-    // c[i] = sum_{j+k=i} a[j]*a[k]  (with mod-p reduction for j+k >= 5)
     u64 a0 = a[0], a1 = a[1], a2 = a[2], a3 = a[3], a4 = a[4];
 
     u128 s0 = (u128)a0 * a0 + 2 * ((u128)a1 * (a4_19) + (u128)a2 * (a3 * 19));
