@@ -32,9 +32,9 @@ void setup_signal_handlers() {
 
 struct CommandLineArgs {
     std::string config_file;
-    tor::modes::RelayMode mode{tor::modes::RelayMode::Middle};
-    uint16_t or_port{9001};
-    uint16_t dir_port{0};
+    std::optional<tor::modes::RelayMode> mode;
+    std::optional<uint16_t> or_port;
+    std::optional<uint16_t> dir_port;
     std::string nickname;
     std::string data_dir;
     bool foreground{false};
@@ -115,7 +115,7 @@ std::optional<CommandLineArgs> parse_args(int argc, char* argv[]) {
                 std::cerr << "Error: Invalid mode '" << value << "'. Use: middle, exit, bridge, or guard\n";
                 return std::nullopt;
             }
-            args.mode = *mode_result;
+            args.mode = mode_result.value();
         } else if (arg == "-p" || arg == "--port") {
             try {
                 int port = std::stoi(value);
@@ -179,10 +179,10 @@ tor::util::Config create_config(const CommandLineArgs& args) {
         }
     }
 
-    // Override with command-line arguments
-    config.relay.mode = args.mode;
-    config.relay.or_port = args.or_port;
-    config.relay.dir_port = args.dir_port;
+    // Override with command-line arguments (only if explicitly provided)
+    if (args.mode) config.relay.mode = *args.mode;
+    if (args.or_port) config.relay.or_port = *args.or_port;
+    if (args.dir_port) config.relay.dir_port = *args.dir_port;
 
     if (!args.nickname.empty()) {
         config.relay.nickname = args.nickname;
@@ -229,12 +229,15 @@ int main(int argc, char* argv[]) {
     logger.set_level(args.log_level);
     logger.add_sink(std::make_shared<tor::util::ConsoleSink>());
 
-    LOG_INFO("Starting Tor Relay...");
-    LOG_INFO("Mode: {}", tor::modes::relay_mode_name(args.mode));
-    LOG_INFO("OR Port: {}", args.or_port);
-
     // Create configuration
     auto config = create_config(args);
+
+    LOG_INFO("Starting Tor Relay...");
+    LOG_INFO("Mode: {}", tor::modes::relay_mode_name(config.relay.mode));
+    LOG_INFO("OR Port: {}", config.relay.or_port);
+    if (!config.bridge.transport.empty()) {
+        LOG_INFO("Transport: {} on port {}", config.bridge.transport, config.bridge.transport_port);
+    }
 
     // Ensure data directory exists
     try {
