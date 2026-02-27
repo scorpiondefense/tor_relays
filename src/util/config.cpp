@@ -144,10 +144,10 @@ std::expected<Config, ConfigError> Config::load_from_string(const std::string& t
     auto bw_rate = get_int(m, "relay.bandwidth.rate", 0);
     auto bw_burst = get_int(m, "relay.bandwidth.burst", 0);
     if (bw_rate > 0) {
-        config.relay.bandwidth.rate_bytes_per_sec = static_cast<size_t>(bw_rate);
+        config.relay.bandwidth.rate = static_cast<uint64_t>(bw_rate);
     }
     if (bw_burst > 0) {
-        config.relay.bandwidth.burst_bytes = static_cast<size_t>(bw_burst);
+        config.relay.bandwidth.burst = static_cast<uint64_t>(bw_burst);
     }
 
     // [bridge]
