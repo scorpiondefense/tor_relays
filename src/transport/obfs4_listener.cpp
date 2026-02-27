@@ -76,7 +76,7 @@ void Obfs4Listener::handle_connection(std::shared_ptr<net::TcpConnection> conn) 
     auto buffer = std::make_shared<std::array<uint8_t, 4096>>();
 
     // Handshake state machine: read -> consume -> check state -> loop or finish
-    struct HandshakeReader : std::enable_shared_from_this<HandshakeReader> {
+    struct HandshakeReader {
         std::shared_ptr<net::TcpConnection> conn;
         std::shared_ptr<Obfs4ServerHandshake> handshake;
         std::shared_ptr<std::array<uint8_t, 4096>> buffer;
