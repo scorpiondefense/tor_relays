@@ -137,8 +137,9 @@ std::expected<Config, ConfigError> Config::load_from_string(const std::string& t
     auto address = get(m, "relay.address");
     if (!address.empty()) config.relay.address = address;
 
-    auto bind_address = get(m, "relay.bind_address");
-    if (!bind_address.empty()) config.relay.address = bind_address;
+    // bind_address is handled at runtime (listener always binds to 0.0.0.0);
+    // it should NOT overwrite the public-facing address used in bridge lines
+    (void)get(m, "relay.bind_address");
 
     // [relay.bandwidth]
     auto bw_rate = get_int(m, "relay.bandwidth.rate", 0);
