@@ -57,4 +57,6 @@ class TorRelaysConan(ConanFile):
         self.cpp_info.requires = [
             "openssl::openssl",
             "boost::headers",
+            "spdlog::spdlog",
+            "toml11::toml11",
         ]
