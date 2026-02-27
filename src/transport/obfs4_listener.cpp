@@ -44,10 +44,12 @@ Obfs4Listener::start(const std::string& address, uint16_t port) {
     // Start accept loop
     acceptor_->start_accept_loop([this](auto result) {
         if (!result) {
+            LOG_WARN("obfs4: accept error");
             return;
         }
 
-        connections_accepted_.fetch_add(1, std::memory_order_relaxed);
+        auto count = connections_accepted_.fetch_add(1, std::memory_order_relaxed) + 1;
+        LOG_INFO("obfs4: accepted connection #{}", count);
         handle_connection(*result);
     });
 
@@ -67,6 +69,7 @@ void Obfs4Listener::stop() {
 }
 
 void Obfs4Listener::handle_connection(std::shared_ptr<net::TcpConnection> conn) {
+    LOG_INFO("obfs4: starting handshake for new connection");
     auto handshake = std::make_shared<Obfs4ServerHandshake>(node_id_, identity_key_);
 
     auto stats_completed = &handshakes_completed_;
@@ -95,15 +98,17 @@ void Obfs4Listener::handle_connection(std::shared_ptr<net::TcpConnection> conn) 
                 std::span<uint8_t>(buffer->data(), buffer->size()));
 
             if (!bytes_read || *bytes_read == 0) {
-                LOG_DEBUG("obfs4 handshake: connection closed during read");
+                LOG_WARN("obfs4 handshake: connection closed during read");
                 failed->fetch_add(1, std::memory_order_relaxed);
                 return;
             }
 
+            LOG_INFO("obfs4 handshake: received {} bytes", *bytes_read);
+
             auto data = std::span<const uint8_t>(buffer->data(), *bytes_read);
             auto consume_result = handshake->consume(data);
             if (!consume_result) {
-                LOG_DEBUG("obfs4 handshake failed: {}",
+                LOG_WARN("obfs4 handshake failed: {}",
                          obfs4_error_message(consume_result.error()));
                 failed->fetch_add(1, std::memory_order_relaxed);
                 return;
@@ -171,7 +176,7 @@ void Obfs4Listener::handle_connection(std::shared_ptr<net::TcpConnection> conn) 
                 auto encrypted = std::span<const uint8_t>(proxy_buf->data(), *obfs4_read);
                 auto frames = shared_framing->decode(encrypted);
                 if (!frames) {
-                    LOG_DEBUG("obfs4: frame decryption failed");
+                    LOG_WARN("obfs4: frame decryption failed");
                     break;
                 }
 

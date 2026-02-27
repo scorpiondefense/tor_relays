@@ -1,8 +1,27 @@
 #include "tor/transport/obfs4.hpp"
+#include "tor/util/logging.hpp"
 #include <algorithm>
 #include <cstring>
 
 namespace tor::transport {
+
+// --- ntor protocol constants ---
+// These must match the obfs4proxy/lyrebird Go implementation exactly
+
+static constexpr const char PROTO_ID[] = "ntor-curve25519-sha256-1";
+static constexpr size_t PROTO_ID_LEN = 24; // strlen(PROTO_ID)
+
+static constexpr const char T_MAC[] = "ntor-curve25519-sha256-1:mac";
+static constexpr size_t T_MAC_LEN = 28;
+
+static constexpr const char T_KEY[] = "ntor-curve25519-sha256-1:key_extract";
+static constexpr size_t T_KEY_LEN = 37;
+
+static constexpr const char T_VERIFY[] = "ntor-curve25519-sha256-1:key_verify";
+static constexpr size_t T_VERIFY_LEN = 36;
+
+static constexpr const char M_EXPAND[] = "ntor-curve25519-sha256-1:key_expand";
+static constexpr size_t M_EXPAND_LEN = 36;
 
 // --- Utility ---
 
@@ -33,13 +52,12 @@ std::string obfs4_error_message(Obfs4Error err) {
     }
 }
 
-// --- Base64url (no padding) encoding/decoding ---
+// --- Base64 (no padding) encoding/decoding ---
 
-static const char B64URL_CHARS[] =
+static const char B64_CHARS[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-static std::string base64url_encode_nopad(std::span<const uint8_t> data) {
-    // Use standard base64 but with +/ (obfs4 spec uses standard base64, not URL-safe)
+static std::string base64_encode_nopad(std::span<const uint8_t> data) {
     std::string result;
     result.reserve((data.size() * 4 + 2) / 3);
 
@@ -48,23 +66,23 @@ static std::string base64url_encode_nopad(std::span<const uint8_t> data) {
         uint32_t n = (static_cast<uint32_t>(data[i]) << 16) |
                      (static_cast<uint32_t>(data[i + 1]) << 8) |
                      static_cast<uint32_t>(data[i + 2]);
-        result += B64URL_CHARS[(n >> 18) & 63];
-        result += B64URL_CHARS[(n >> 12) & 63];
-        result += B64URL_CHARS[(n >> 6) & 63];
-        result += B64URL_CHARS[n & 63];
+        result += B64_CHARS[(n >> 18) & 63];
+        result += B64_CHARS[(n >> 12) & 63];
+        result += B64_CHARS[(n >> 6) & 63];
+        result += B64_CHARS[n & 63];
         i += 3;
     }
 
     if (i + 1 == data.size()) {
         uint32_t n = static_cast<uint32_t>(data[i]) << 16;
-        result += B64URL_CHARS[(n >> 18) & 63];
-        result += B64URL_CHARS[(n >> 12) & 63];
+        result += B64_CHARS[(n >> 18) & 63];
+        result += B64_CHARS[(n >> 12) & 63];
     } else if (i + 2 == data.size()) {
         uint32_t n = (static_cast<uint32_t>(data[i]) << 16) |
                      (static_cast<uint32_t>(data[i + 1]) << 8);
-        result += B64URL_CHARS[(n >> 18) & 63];
-        result += B64URL_CHARS[(n >> 12) & 63];
-        result += B64URL_CHARS[(n >> 6) & 63];
+        result += B64_CHARS[(n >> 18) & 63];
+        result += B64_CHARS[(n >> 12) & 63];
+        result += B64_CHARS[(n >> 6) & 63];
     }
 
     return result;
@@ -80,8 +98,7 @@ static int b64_decode_char(char c) {
 }
 
 static std::expected<std::vector<uint8_t>, Obfs4Error>
-base64url_decode_nopad(const std::string& encoded) {
-    // Add padding if needed
+base64_decode_nopad(const std::string& encoded) {
     std::string padded = encoded;
     while (padded.size() % 4 != 0)
         padded += '=';
@@ -121,12 +138,12 @@ std::string Obfs4Identity::to_cert() const {
     std::memcpy(raw.data(), node_id.data().data(), OBFS4_NODE_ID_LEN);
     std::memcpy(raw.data() + OBFS4_NODE_ID_LEN,
                 ntor_public_key.data().data(), OBFS4_PUBKEY_LEN);
-    return base64url_encode_nopad(raw);
+    return base64_encode_nopad(raw);
 }
 
 std::expected<Obfs4Identity, Obfs4Error>
 Obfs4Identity::from_cert(const std::string& cert) {
-    auto decoded = base64url_decode_nopad(cert);
+    auto decoded = base64_decode_nopad(cert);
     if (!decoded) {
         return std::unexpected(Obfs4Error::InvalidCert);
     }
@@ -156,6 +173,18 @@ Obfs4ServerHandshake::Obfs4ServerHandshake(
     : node_id_(node_id)
     , identity_key_(identity_key) {}
 
+// Build the obfs4 HMAC key: identity_pub[32] || node_id[20]
+// This is used for mark scanning and epoch-hour MAC verification.
+// Must match the Go implementation: append(serverIdentity.Public().Bytes(), nodeID.Bytes()...)
+std::vector<uint8_t> Obfs4ServerHandshake::mac_key() const {
+    std::vector<uint8_t> key;
+    key.reserve(32 + 20);
+    auto pub = identity_key_.public_key();
+    key.insert(key.end(), pub.data().begin(), pub.data().end());
+    key.insert(key.end(), node_id_.data().begin(), node_id_.data().end());
+    return key;
+}
+
 std::expected<size_t, Obfs4Error>
 Obfs4ServerHandshake::consume(std::span<const uint8_t> data) {
     if (state_ == State::Completed || state_ == State::Failed) {
@@ -175,80 +204,82 @@ Obfs4ServerHandshake::consume(std::span<const uint8_t> data) {
         return std::unexpected(Obfs4Error::BufferOverflow);
     }
 
+    // Helper lambda to complete the handshake once mark+MAC are verified
+    auto complete_handshake = [&](size_t mark_pos) -> std::expected<size_t, Obfs4Error> {
+        // Generate server ephemeral representable keypair
+        auto eph_result = crypto::Elligator2::generate_representable_keypair();
+        if (!eph_result) {
+            state_ = State::Failed;
+            return std::unexpected(Obfs4Error::KeyGenerationFailed);
+        }
+        server_ephemeral_ = std::move(*eph_result);
+
+        auto eph_sk = crypto::Curve25519SecretKey::from_bytes(server_ephemeral_->secret);
+        if (!eph_sk) {
+            state_ = State::Failed;
+            return std::unexpected(Obfs4Error::KeyGenerationFailed);
+        }
+
+        // Compute shared secrets per ntor spec:
+        // EXP1 = DH(server_ephemeral, client_pub) — ephemeral-ephemeral
+        auto exp_eph = eph_sk->diffie_hellman(client_public_key_);
+        if (!exp_eph) {
+            state_ = State::Failed;
+            return std::unexpected(Obfs4Error::HandshakeFailed);
+        }
+
+        // EXP2 = DH(server_identity, client_pub) — identity-ephemeral
+        auto exp_id = identity_key_.diffie_hellman(client_public_key_);
+        if (!exp_id) {
+            state_ = State::Failed;
+            return std::unexpected(Obfs4Error::HandshakeFailed);
+        }
+
+        // Server ephemeral public key (Y)
+        auto server_eph_pub = eph_sk->public_key();
+
+        // Derive ntor keys: KEY_SEED, verify, auth, session keys
+        derive_keys(*exp_eph, *exp_id,
+                    identity_key_.public_key(), client_public_key_, server_eph_pub);
+
+        state_ = State::Completed;
+
+        // Calculate how many bytes were actually consumed for the handshake
+        size_t mac_end = mark_pos + OBFS4_MARK_LEN + OBFS4_MAC_LEN;
+        if (mac_end < buffer_.size()) {
+            consumed = consumed - (buffer_.size() - mac_end);
+        }
+
+        return consumed;
+    };
+
     if (state_ == State::WaitingForMark) {
-        // Need at least representative[32] + mark[16]
         if (buffer_.size() < OBFS4_REPR_LEN + OBFS4_MARK_LEN) {
             return consumed;
         }
 
         auto mark_pos = find_mark();
         if (!mark_pos) {
-            // Haven't found mark yet, keep waiting
             return consumed;
         }
 
-        // Mark found at position *mark_pos
-        // Extract representative (first 32 bytes)
+        // Mark found — extract representative and recover client public key
         std::memcpy(client_representative_.data(), buffer_.data(), OBFS4_REPR_LEN);
-
-        // Recover client public key via Elligator2
         client_public_key_ = crypto::Elligator2::representative_to_point(
             client_representative_);
 
         state_ = State::WaitingForMac;
 
-        // Check if we have enough data for the MAC too
-        size_t mac_start = *mark_pos + OBFS4_MARK_LEN;
-        size_t mac_end = mac_start + OBFS4_MAC_LEN;
-
+        // Check if we already have enough data for the MAC
+        size_t mac_end = *mark_pos + OBFS4_MARK_LEN + OBFS4_MAC_LEN;
         if (buffer_.size() >= mac_end) {
             if (!verify_epoch_mac(*mark_pos)) {
                 state_ = State::Failed;
                 return std::unexpected(Obfs4Error::MacVerificationFailed);
             }
-
-            // Compute shared secrets
-            auto shared_eph = identity_key_.diffie_hellman(client_public_key_);
-            if (!shared_eph) {
-                state_ = State::Failed;
-                return std::unexpected(Obfs4Error::HandshakeFailed);
-            }
-
-            // For the server handshake, we also need an ephemeral key
-            auto eph_result = crypto::Elligator2::generate_representable_keypair();
-            if (!eph_result) {
-                state_ = State::Failed;
-                return std::unexpected(Obfs4Error::KeyGenerationFailed);
-            }
-            server_ephemeral_ = std::move(*eph_result);
-
-            // Second shared secret: ephemeral DH
-            auto eph_sk = crypto::Curve25519SecretKey::from_bytes(server_ephemeral_->secret);
-            if (!eph_sk) {
-                state_ = State::Failed;
-                return std::unexpected(Obfs4Error::KeyGenerationFailed);
-            }
-
-            auto shared_id = eph_sk->diffie_hellman(client_public_key_);
-            if (!shared_id) {
-                state_ = State::Failed;
-                return std::unexpected(Obfs4Error::HandshakeFailed);
-            }
-
-            derive_keys(*shared_eph, *shared_id);
-
-            state_ = State::Completed;
-
-            // Calculate how many bytes were actually consumed for the handshake
-            // Any bytes after mac_end are post-handshake data
-            size_t handshake_len = mac_end;
-            if (handshake_len < buffer_.size()) {
-                // Some bytes in buffer are post-handshake, adjust consumed
-                consumed = consumed - (buffer_.size() - handshake_len);
-            }
+            return complete_handshake(*mark_pos);
         }
     } else if (state_ == State::WaitingForMac) {
-        // We already found the mark, just waiting for MAC bytes
         auto mark_pos = find_mark();
         if (mark_pos) {
             size_t mac_end = *mark_pos + OBFS4_MARK_LEN + OBFS4_MAC_LEN;
@@ -257,34 +288,7 @@ Obfs4ServerHandshake::consume(std::span<const uint8_t> data) {
                     state_ = State::Failed;
                     return std::unexpected(Obfs4Error::MacVerificationFailed);
                 }
-
-                auto shared_eph = identity_key_.diffie_hellman(client_public_key_);
-                if (!shared_eph) {
-                    state_ = State::Failed;
-                    return std::unexpected(Obfs4Error::HandshakeFailed);
-                }
-
-                auto eph_result = crypto::Elligator2::generate_representable_keypair();
-                if (!eph_result) {
-                    state_ = State::Failed;
-                    return std::unexpected(Obfs4Error::KeyGenerationFailed);
-                }
-                server_ephemeral_ = std::move(*eph_result);
-
-                auto eph_sk = crypto::Curve25519SecretKey::from_bytes(server_ephemeral_->secret);
-                if (!eph_sk) {
-                    state_ = State::Failed;
-                    return std::unexpected(Obfs4Error::KeyGenerationFailed);
-                }
-
-                auto shared_id = eph_sk->diffie_hellman(client_public_key_);
-                if (!shared_id) {
-                    state_ = State::Failed;
-                    return std::unexpected(Obfs4Error::HandshakeFailed);
-                }
-
-                derive_keys(*shared_eph, *shared_id);
-                state_ = State::Completed;
+                return complete_handshake(*mark_pos);
             }
         }
     }
@@ -293,29 +297,31 @@ Obfs4ServerHandshake::consume(std::span<const uint8_t> data) {
 }
 
 std::optional<size_t> Obfs4ServerHandshake::find_mark() const {
-    // The mark is HMAC-SHA256(node_id, representative[0:32]) truncated to 16 bytes
-    // It appears immediately after the representative in the client handshake
+    // The mark is HMAC-SHA256-128(key, representative[0:32]) truncated to 16 bytes
+    // where key = identity_pub[32] || node_id[20]
+    // It appears after the representative + random padding in the client handshake
 
     if (buffer_.size() < OBFS4_REPR_LEN + OBFS4_MARK_LEN) {
         return std::nullopt;
     }
 
-    // Compute expected mark
+    // Build the HMAC key: identity_pub || node_id
+    auto key = mac_key();
+
+    // Compute expected mark: HMAC-SHA256(key, representative)
     auto hmac_result = crypto::hmac_sha256(
-        node_id_.as_span(),
+        key,
         std::span<const uint8_t>(buffer_.data(), OBFS4_REPR_LEN));
 
     if (!hmac_result) {
         return std::nullopt;
     }
 
-    // Search for the 16-byte mark in the buffer starting after the representative
-    std::span<const uint8_t> expected_mark(hmac_result->data(), OBFS4_MARK_LEN);
-
+    // Search for the 16-byte truncated mark in the buffer after the representative
     for (size_t pos = OBFS4_REPR_LEN; pos + OBFS4_MARK_LEN <= buffer_.size(); ++pos) {
         bool match = true;
         for (size_t j = 0; j < OBFS4_MARK_LEN; ++j) {
-            if (buffer_[pos + j] != expected_mark[j]) {
+            if (buffer_[pos + j] != (*hmac_result)[j]) {
                 match = false;
                 break;
             }
@@ -329,14 +335,16 @@ std::optional<size_t> Obfs4ServerHandshake::find_mark() const {
 }
 
 bool Obfs4ServerHandshake::verify_epoch_mac(size_t mark_pos) const {
-    // The MAC covers: representative || mark || epoch_hour_string
-    // MAC key is the node ID
+    // MAC = HMAC-SHA256-128(key, representative || padding || mark || epoch_hour_string)
+    // where key = identity_pub[32] || node_id[20]
+    // MAC is truncated to 16 bytes
 
     size_t mac_start = mark_pos + OBFS4_MARK_LEN;
     if (buffer_.size() < mac_start + OBFS4_MAC_LEN) {
         return false;
     }
 
+    auto key = mac_key();
     auto current_hour = epoch_hour();
 
     // Try current hour and +/- 1 hour for clock skew tolerance
@@ -344,7 +352,8 @@ bool Obfs4ServerHandshake::verify_epoch_mac(size_t mark_pos) const {
         auto hour = current_hour + offset;
         auto hour_str = std::to_string(hour);
 
-        // Construct MAC input: representative[0:32] || mark[16] || epoch_hour_string
+        // MAC input: buffer[0 : mark_pos + MARK_LEN] || epoch_hour_string
+        // This includes: representative + padding + mark
         std::vector<uint8_t> mac_input;
         mac_input.insert(mac_input.end(), buffer_.begin(),
                          buffer_.begin() + mark_pos + OBFS4_MARK_LEN);
@@ -352,9 +361,10 @@ bool Obfs4ServerHandshake::verify_epoch_mac(size_t mark_pos) const {
                          reinterpret_cast<const uint8_t*>(hour_str.data()),
                          reinterpret_cast<const uint8_t*>(hour_str.data() + hour_str.size()));
 
-        auto expected_mac = crypto::hmac_sha256(node_id_.as_span(), mac_input);
+        auto expected_mac = crypto::hmac_sha256(key, mac_input);
         if (!expected_mac) continue;
 
+        // Compare only first 16 bytes (HMAC-SHA256-128)
         if (crypto::constant_time_compare(
                 std::span<const uint8_t>(buffer_.data() + mac_start, OBFS4_MAC_LEN),
                 std::span<const uint8_t>(expected_mac->data(), OBFS4_MAC_LEN))) {
@@ -366,43 +376,123 @@ bool Obfs4ServerHandshake::verify_epoch_mac(size_t mark_pos) const {
 }
 
 void Obfs4ServerHandshake::derive_keys(
-    std::span<const uint8_t, 32> shared_secret_eph,
-    std::span<const uint8_t, 32> shared_secret_id) {
+    std::span<const uint8_t, 32> exp_eph,
+    std::span<const uint8_t, 32> exp_id,
+    const crypto::Curve25519PublicKey& server_identity_pub,
+    const crypto::Curve25519PublicKey& client_pub,
+    const crypto::Curve25519PublicKey& server_eph_pub) {
 
-    // Concatenate shared secrets for key derivation
-    std::vector<uint8_t> ikm;
-    ikm.insert(ikm.end(), shared_secret_eph.begin(), shared_secret_eph.end());
-    ikm.insert(ikm.end(), shared_secret_id.begin(), shared_secret_id.end());
+    // Build secret_input per obfs4 ntor spec (matches Go implementation):
+    // secret_input = EXP1 | EXP2 | B | B | X | Y | PROTOID | ID
+    // where:
+    //   EXP1 = DH(server_eph, client_eph) — ephemeral-ephemeral
+    //   EXP2 = DH(server_identity, client_eph) — identity-ephemeral
+    //   B = server identity public key (appears TWICE)
+    //   X = client ephemeral public key
+    //   Y = server ephemeral public key
+    //   PROTOID = "ntor-curve25519-sha256-1"
+    //   ID = node ID (20 bytes)
 
-    // Use HKDF-SHA256 to derive session keys
-    // Salt: node_id
-    // Info: "obfs4-session-keys"
-    static const uint8_t info[] = "obfs4-session-keys";
+    std::vector<uint8_t> secret_input;
+    secret_input.reserve(32 + 32 + 32 + 32 + 32 + 32 + PROTO_ID_LEN + 20); // 236 bytes
 
-    // Derive 2*32 + 2*24 = 112 bytes of key material
+    // EXP1: DH(server_eph, client)
+    secret_input.insert(secret_input.end(), exp_eph.begin(), exp_eph.end());
+    // EXP2: DH(server_identity, client)
+    secret_input.insert(secret_input.end(), exp_id.begin(), exp_id.end());
+    // B (server identity pub) — first copy
+    secret_input.insert(secret_input.end(),
+                        server_identity_pub.data().begin(), server_identity_pub.data().end());
+    // B (server identity pub) — second copy
+    secret_input.insert(secret_input.end(),
+                        server_identity_pub.data().begin(), server_identity_pub.data().end());
+    // X (client ephemeral pub)
+    secret_input.insert(secret_input.end(),
+                        client_pub.data().begin(), client_pub.data().end());
+    // Y (server ephemeral pub)
+    secret_input.insert(secret_input.end(),
+                        server_eph_pub.data().begin(), server_eph_pub.data().end());
+    // PROTOID
+    secret_input.insert(secret_input.end(),
+                        reinterpret_cast<const uint8_t*>(PROTO_ID),
+                        reinterpret_cast<const uint8_t*>(PROTO_ID) + PROTO_ID_LEN);
+    // ID (node ID, 20 bytes)
+    secret_input.insert(secret_input.end(),
+                        node_id_.data().begin(), node_id_.data().end());
+
+    // Build suffix = B | B | X | Y | PROTOID | ID (reused for auth_input)
+    // suffix starts at offset 64 in secret_input (after the two 32-byte exponents)
+    auto suffix_begin = secret_input.begin() + 64;
+    auto suffix_end = secret_input.end();
+
+    // Step 1: KEY_SEED = HMAC-SHA256(key=t_key, message=secret_input)
+    auto t_key_span = std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>(T_KEY), T_KEY_LEN);
+    auto key_seed = crypto::hmac_sha256(t_key_span, secret_input);
+    if (!key_seed) return;
+
+    // Step 2: verify = HMAC-SHA256(key=t_verify, message=secret_input)
+    auto t_verify_span = std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>(T_VERIFY), T_VERIFY_LEN);
+    auto verify = crypto::hmac_sha256(t_verify_span, secret_input);
+    if (!verify) return;
+
+    // Step 3: auth = HMAC-SHA256(key=t_mac, message=(verify | suffix | "Server"))
+    auto t_mac_span = std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>(T_MAC), T_MAC_LEN);
+
+    std::vector<uint8_t> auth_input;
+    auth_input.insert(auth_input.end(), verify->begin(), verify->end());
+    auth_input.insert(auth_input.end(), suffix_begin, suffix_end);
+    static constexpr const char SERVER_STR[] = "Server";
+    auth_input.insert(auth_input.end(),
+                      reinterpret_cast<const uint8_t*>(SERVER_STR),
+                      reinterpret_cast<const uint8_t*>(SERVER_STR) + 6);
+
+    auto auth_result = crypto::hmac_sha256(t_mac_span, auth_input);
+    if (!auth_result) return;
+    std::memcpy(auth_.data(), auth_result->data(), 32);
+
+    // Step 4: Expand KEY_SEED into 144 bytes of session key material
+    // Using HKDF-SHA256: Extract(salt=t_key, IKM=KEY_SEED) then Expand(info=m_expand, len=144)
+    auto m_expand_span = std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>(M_EXPAND), M_EXPAND_LEN);
     auto key_material = crypto::hkdf_sha256(
-        node_id_.as_span(),
-        ikm,
-        std::span<const uint8_t>(info, sizeof(info) - 1),
-        112);
+        t_key_span,       // salt
+        *key_seed,        // IKM
+        m_expand_span,    // info
+        144);             // output length
 
-    if (!key_material) {
-        return;
-    }
+    if (!key_material) return;
 
     auto& km = *key_material;
 
-    // Server send key (key[0:32])
-    std::memcpy(session_keys_.send_key.data(), km.data(), 32);
-    // Server recv key (key[32:64])
-    std::memcpy(session_keys_.recv_key.data(), km.data() + 32, 32);
-    // Server send nonce (key[64:88])
-    std::memcpy(session_keys_.send_nonce.data(), km.data() + 64, 24);
-    // Server recv nonce (key[88:112])
-    std::memcpy(session_keys_.recv_nonce.data(), km.data() + 88, 24);
+    // Split 144 bytes into two 72-byte halves:
+    // okm[0:72]   = client encoder key / server decoder key
+    // okm[72:144] = client decoder key / server encoder key
+    //
+    // Each 72-byte block: secretbox_key[32] | nonce_prefix[16] | drbg_seed[24]
+    // For now, map into current SessionKeys format (32-byte key + 24-byte nonce)
 
-    // Wipe IKM
-    std::memset(ikm.data(), 0, ikm.size());
+    // Server recv (client encoder) = okm[0:72]
+    std::memcpy(session_keys_.recv_key.data(), km.data(), 32);
+    // Build recv nonce: prefix[16] || counter[8] with counter=1
+    std::array<uint8_t, 24> recv_nonce{};
+    std::memcpy(recv_nonce.data(), km.data() + 32, 16);
+    // Counter starts at 1 (big-endian)
+    recv_nonce[23] = 1;
+    std::memcpy(session_keys_.recv_nonce.data(), recv_nonce.data(), 24);
+
+    // Server send (client decoder) = okm[72:144]
+    std::memcpy(session_keys_.send_key.data(), km.data() + 72, 32);
+    // Build send nonce: prefix[16] || counter[8] with counter=1
+    std::array<uint8_t, 24> send_nonce{};
+    std::memcpy(send_nonce.data(), km.data() + 72 + 32, 16);
+    send_nonce[23] = 1;
+    std::memcpy(session_keys_.send_nonce.data(), send_nonce.data(), 24);
+
+    // Wipe sensitive data
+    std::memset(secret_input.data(), 0, secret_input.size());
 }
 
 std::expected<std::vector<uint8_t>, Obfs4Error>
@@ -411,60 +501,50 @@ Obfs4ServerHandshake::generate_server_hello() {
         return std::unexpected(Obfs4Error::InternalError);
     }
 
-    // Server hello: representative[32] || auth[32] || mark[16] || mac[32] || padding
+    // Server hello format (matches Go obfs4proxy):
+    // Y_repr[32] | AUTH[32] | padding[variable] | mark[16] | mac[16]
+
+    auto key = mac_key();
     std::vector<uint8_t> hello;
 
-    // 1. Server representative (32 bytes)
+    // 1. Server representative Y_repr (32 bytes)
     hello.insert(hello.end(),
                  server_ephemeral_->representative.begin(),
                  server_ephemeral_->representative.end());
 
-    // 2. Auth: HMAC-SHA256(shared_secret, server_repr || client_repr)
-    std::vector<uint8_t> auth_input;
-    auth_input.insert(auth_input.end(),
-                      server_ephemeral_->representative.begin(),
-                      server_ephemeral_->representative.end());
-    auth_input.insert(auth_input.end(),
-                      client_representative_.begin(),
-                      client_representative_.end());
+    // 2. ntor AUTH (32 bytes) — computed during derive_keys
+    hello.insert(hello.end(), auth_.begin(), auth_.end());
 
-    // Use first shared secret as auth key
-    auto auth_mac = crypto::hmac_sha256(
-        session_keys_.send_key,
-        auth_input);
-    if (!auth_mac) {
-        return std::unexpected(Obfs4Error::InternalError);
-    }
-    hello.insert(hello.end(), auth_mac->begin(), auth_mac->end());
+    // 3. Random padding (between auth and mark)
+    auto pad_len_bytes = crypto::random_bytes(2);
+    uint16_t pad_len = (static_cast<uint16_t>(pad_len_bytes[0]) |
+                       (static_cast<uint16_t>(pad_len_bytes[1]) << 8)) % 512;
+    auto padding = crypto::random_bytes(pad_len);
+    hello.insert(hello.end(), padding.begin(), padding.end());
 
-    // 3. Mark: HMAC-SHA256(node_id, server_repr) truncated to 16 bytes
+    // 4. Mark: HMAC-SHA256-128(key, Y_repr) truncated to 16 bytes
     auto mark_hmac = crypto::hmac_sha256(
-        node_id_.as_span(),
+        key,
         server_ephemeral_->representative);
     if (!mark_hmac) {
         return std::unexpected(Obfs4Error::InternalError);
     }
     hello.insert(hello.end(), mark_hmac->begin(), mark_hmac->begin() + OBFS4_MARK_LEN);
 
-    // 4. Epoch-hour MAC
+    // 5. Epoch-hour MAC: HMAC-SHA256-128(key, Y_repr || AUTH || padding || mark || epoch_str)
+    //    truncated to 16 bytes
     auto hour_str = std::to_string(epoch_hour());
     std::vector<uint8_t> mac_input(hello.begin(), hello.end());
     mac_input.insert(mac_input.end(),
                      reinterpret_cast<const uint8_t*>(hour_str.data()),
                      reinterpret_cast<const uint8_t*>(hour_str.data() + hour_str.size()));
 
-    auto epoch_mac = crypto::hmac_sha256(node_id_.as_span(), mac_input);
+    auto epoch_mac = crypto::hmac_sha256(key, mac_input);
     if (!epoch_mac) {
         return std::unexpected(Obfs4Error::InternalError);
     }
-    hello.insert(hello.end(), epoch_mac->begin(), epoch_mac->end());
-
-    // 5. Random padding (0-8192 bytes, but keep it small for now)
-    auto pad_len_bytes = crypto::random_bytes(2);
-    uint16_t pad_len = (static_cast<uint16_t>(pad_len_bytes[0]) |
-                       (static_cast<uint16_t>(pad_len_bytes[1]) << 8)) % 512;
-    auto padding = crypto::random_bytes(pad_len);
-    hello.insert(hello.end(), padding.begin(), padding.end());
+    // Truncate MAC to 16 bytes
+    hello.insert(hello.end(), epoch_mac->begin(), epoch_mac->begin() + OBFS4_MAC_LEN);
 
     return hello;
 }
@@ -486,8 +566,9 @@ void Obfs4Framing::init_recv(std::span<const uint8_t, 32> key,
 }
 
 void Obfs4Framing::increment_nonce(std::array<uint8_t, 24>& nonce) {
-    // Little-endian increment
-    for (size_t i = 0; i < nonce.size(); ++i) {
+    // Big-endian increment of the last 8 bytes (counter portion)
+    // Nonce format: prefix[16] || counter[8] (big-endian)
+    for (int i = 23; i >= 16; --i) {
         if (++nonce[i] != 0) break;
     }
 }
@@ -496,10 +577,11 @@ std::vector<uint8_t> Obfs4Framing::encode(std::span<const uint8_t> payload) {
     // Frame format:
     // secretbox_seal(length[2]) || secretbox_seal(payload)
     // where length is big-endian uint16
+    // NOTE: Real obfs4 uses SipHash XOR for length, not secretbox.
+    // This will be fixed in a follow-up commit.
 
     std::vector<uint8_t> output;
 
-    // Encrypt length (2 bytes, big-endian)
     uint16_t len = static_cast<uint16_t>(payload.size());
     std::array<uint8_t, 2> len_bytes = {
         static_cast<uint8_t>(len >> 8),
@@ -509,7 +591,6 @@ std::vector<uint8_t> Obfs4Framing::encode(std::span<const uint8_t> payload) {
     auto sealed_len = crypto::Secretbox::seal(send_key_, send_nonce_, len_bytes);
     increment_nonce(send_nonce_);
 
-    // Encrypt payload
     auto sealed_payload = crypto::Secretbox::seal(send_key_, send_nonce_, payload);
     increment_nonce(send_nonce_);
 
@@ -524,16 +605,13 @@ Obfs4Framing::decode(std::span<const uint8_t> data) {
     DecodeResult result;
     result.consumed = 0;
 
-    // Add incoming data to buffer
     recv_buffer_.insert(recv_buffer_.end(), data.begin(), data.end());
 
     while (true) {
         if (!pending_payload_len_) {
-            // Need to decrypt the length header
-            // sealed length = 2 + 16 = 18 bytes
             constexpr size_t SEALED_LEN_SIZE = 2 + crypto::Secretbox::OVERHEAD;
             if (recv_buffer_.size() < SEALED_LEN_SIZE) {
-                break; // Need more data
+                break;
             }
 
             auto len_ct = std::span<const uint8_t>(recv_buffer_.data(), SEALED_LEN_SIZE);
@@ -555,10 +633,9 @@ Obfs4Framing::decode(std::span<const uint8_t> data) {
             result.consumed += SEALED_LEN_SIZE;
         }
 
-        // We have a pending payload length, try to read the payload
         size_t sealed_payload_size = *pending_payload_len_ + crypto::Secretbox::OVERHEAD;
         if (recv_buffer_.size() < sealed_payload_size) {
-            break; // Need more data
+            break;
         }
 
         auto payload_ct = std::span<const uint8_t>(

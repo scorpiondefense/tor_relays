@@ -20,15 +20,15 @@ constexpr size_t OBFS4_NODE_ID_LEN = 20;       // Tor node ID (SHA-1 of identity
 constexpr size_t OBFS4_PUBKEY_LEN = 32;        // Curve25519 public key
 constexpr size_t OBFS4_REPR_LEN = 32;          // Elligator2 representative
 constexpr size_t OBFS4_MARK_LEN = 16;          // HMAC mark (truncated)
-constexpr size_t OBFS4_MAC_LEN = 32;           // Epoch-hour MAC
-constexpr size_t OBFS4_AUTH_LEN = 32;          // Server authentication
+constexpr size_t OBFS4_MAC_LEN = 16;           // Epoch-hour MAC (HMAC-SHA256-128)
+constexpr size_t OBFS4_AUTH_LEN = 32;          // Server authentication (ntor AUTH)
 constexpr size_t OBFS4_CERT_RAW_LEN = 52;      // node_id[20] + pubkey[32]
 constexpr size_t OBFS4_MAX_HANDSHAKE_LEN = 8192; // Max bytes to buffer for handshake
 constexpr size_t OBFS4_MAX_FRAME_PAYLOAD = 1448; // Max frame payload (MTU-friendly)
 constexpr size_t OBFS4_FRAME_HDR_OVERHEAD = 2 + crypto::Secretbox::OVERHEAD; // 18 bytes
 constexpr size_t OBFS4_FRAME_OVERHEAD = OBFS4_FRAME_HDR_OVERHEAD;
-constexpr size_t OBFS4_MIN_CLIENT_HANDSHAKE = OBFS4_REPR_LEN + OBFS4_MARK_LEN + OBFS4_MAC_LEN; // 80
-constexpr size_t OBFS4_MIN_SERVER_HANDSHAKE = OBFS4_REPR_LEN + OBFS4_AUTH_LEN + OBFS4_MARK_LEN + OBFS4_MAC_LEN; // 112
+constexpr size_t OBFS4_MIN_CLIENT_HANDSHAKE = OBFS4_REPR_LEN + OBFS4_MARK_LEN + OBFS4_MAC_LEN; // 64
+constexpr size_t OBFS4_MIN_SERVER_HANDSHAKE = OBFS4_REPR_LEN + OBFS4_AUTH_LEN + OBFS4_MARK_LEN + OBFS4_MAC_LEN; // 96
 
 // IAT (Inter-Arrival Time) modes
 enum class IatMode : uint8_t {
@@ -124,16 +124,25 @@ private:
     // Derived session keys
     SessionKeys session_keys_{};
 
+    // ntor AUTH value (computed during key derivation, used in server hello)
+    std::array<uint8_t, OBFS4_AUTH_LEN> auth_{};
+
+    // Build the obfs4 HMAC key: identity_pub[32] || node_id[20]
+    [[nodiscard]] std::vector<uint8_t> mac_key() const;
+
     // Scan buffer for HMAC mark
     [[nodiscard]] std::optional<size_t> find_mark() const;
 
     // Verify epoch-hour MAC
     [[nodiscard]] bool verify_epoch_mac(size_t mark_pos) const;
 
-    // Derive session keys from shared secrets
+    // Derive session keys from ntor handshake outputs
     void derive_keys(
-        std::span<const uint8_t, 32> shared_secret_eph,
-        std::span<const uint8_t, 32> shared_secret_id);
+        std::span<const uint8_t, 32> exp_eph,     // DH(server_eph, client_eph)
+        std::span<const uint8_t, 32> exp_id,       // DH(server_identity, client_eph)
+        const crypto::Curve25519PublicKey& server_identity_pub,
+        const crypto::Curve25519PublicKey& client_pub,
+        const crypto::Curve25519PublicKey& server_eph_pub);
 };
 
 // --- obfs4 Framing ---
