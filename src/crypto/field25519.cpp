@@ -328,26 +328,18 @@ std::pair<FieldElement, bool> FieldElement::sqrt() const {
     // If beta^2 == -a, return beta * sqrt(-1)
     // Otherwise, no square root exists
 
-    FieldElement beta = (*this * *this * *this).pow_p58() * *this;
-    // Equivalent: beta = a^((p+3)/8) using a * a^((p-5)/8) = a * (a^3)^((p-5)/8) approach
-    // Actually: (p+3)/8 = (2^255-16)/8 = 2^252-2
-    // Let's use the correct formula:
-    // beta = a^((p+3)/8) = a * (a^((p-5)/8)) ... no.
-    // (p+3)/8 applied to a:
-    // a^((p+3)/8) = a * a^((p-5)/8) = a * pow_p58(a)
-    // Wait: (p+3)/8 = (p-5)/8 + 1, so a^((p+3)/8) = a * a^((p-5)/8)
+    // a^((p+3)/8) = a * a^((p-5)/8) since (p+3)/8 = (p-5)/8 + 1
+    FieldElement beta = this->pow_p58() * *this;
 
-    FieldElement beta2 = this->pow_p58() * *this;  // a^((p-5)/8 + 1) = a^((p+3)/8)
-
-    FieldElement check = beta2.square();
+    FieldElement check = beta.square();
 
     if (check == *this) {
-        return {beta2, true};
+        return {beta, true};
     }
 
     FieldElement neg = FieldElement::zero() - *this;
     if (check == neg) {
-        return {beta2 * sqrt_m1(), true};
+        return {beta * sqrt_m1(), true};
     }
 
     return {FieldElement::zero(), false};
