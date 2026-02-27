@@ -3,8 +3,11 @@
 #include "tor/transport/obfs4.hpp"
 #include "tor/net/acceptor.hpp"
 #include <atomic>
+#include <cstdint>
+#include <expected>
 #include <functional>
 #include <memory>
+#include <string>
 #include <thread>
 
 namespace tor::transport {
