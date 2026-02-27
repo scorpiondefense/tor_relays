@@ -66,7 +66,7 @@ private:
     boost::asio::io_context& io_context_;
     crypto::NodeId node_id_;
     const crypto::Curve25519SecretKey& identity_key_;
-    IatMode iat_mode_;
+    [[maybe_unused]] IatMode iat_mode_;
     std::string cert_;
 
     std::unique_ptr<net::TcpAcceptor> acceptor_;

@@ -3,41 +3,52 @@
 #include "tor/transport/obfs4_listener.hpp"
 #include "tor/crypto/keys.hpp"
 #include "tor/crypto/hash.hpp"
+#include "obfs4/crypto/elligator2.hpp"
+#include "obfs4/common/ntor.hpp"
 #include <cstring>
 
 using namespace tor::transport;
 using namespace tor::crypto;
 
-// Simulated client handshake for testing
+// Simulated client handshake for testing.
+// Uses obfs4_cpp's Elligator2 keypair and correct HMAC key order:
+//   key = identity_pub[32] || node_id[20]
 static std::vector<uint8_t> build_client_handshake(
     const NodeId& node_id,
     const Curve25519PublicKey& server_pubkey,
-    const RepresentableKeypair& client_kp) {
+    const obfs4::crypto::Keypair& client_kp) {
 
     std::vector<uint8_t> handshake;
 
     // 1. Client representative (32 bytes)
+    if (!client_kp.representative) return {};
     handshake.insert(handshake.end(),
-                     client_kp.representative.begin(),
-                     client_kp.representative.end());
+                     client_kp.representative->begin(),
+                     client_kp.representative->end());
 
-    // 2. HMAC mark: HMAC-SHA256(node_id, representative) truncated to 16 bytes
-    auto mark_hmac = hmac_sha256(
-        node_id.as_span(),
-        client_kp.representative);
+    // 2. Build HMAC key: identity_pub[32] || node_id[20] (correct order)
+    std::vector<uint8_t> hmac_key;
+    hmac_key.reserve(32 + 20);
+    hmac_key.insert(hmac_key.end(),
+                    server_pubkey.data().begin(), server_pubkey.data().end());
+    hmac_key.insert(hmac_key.end(),
+                    node_id.data().begin(), node_id.data().end());
+
+    // 3. HMAC mark: HMAC-SHA256(key, representative) truncated to 16 bytes
+    auto mark_hmac = hmac_sha256(hmac_key, *client_kp.representative);
     if (!mark_hmac) return {};
     handshake.insert(handshake.end(),
                      mark_hmac->begin(),
                      mark_hmac->begin() + OBFS4_MARK_LEN);
 
-    // 3. Epoch-hour MAC: HMAC-SHA256(node_id, representative || mark || epoch_str)
+    // 4. Epoch-hour MAC: HMAC-SHA256(key, representative || mark || epoch_str)
     auto hour_str = std::to_string(epoch_hour());
     std::vector<uint8_t> mac_input(handshake.begin(), handshake.end());
     mac_input.insert(mac_input.end(),
                      reinterpret_cast<const uint8_t*>(hour_str.data()),
                      reinterpret_cast<const uint8_t*>(hour_str.data() + hour_str.size()));
 
-    auto epoch_mac = hmac_sha256(node_id.as_span(), mac_input);
+    auto epoch_mac = hmac_sha256(hmac_key, mac_input);
     if (!epoch_mac) return {};
     handshake.insert(handshake.end(), epoch_mac->begin(), epoch_mac->end());
 
@@ -51,16 +62,16 @@ TEST_CASE("End-to-end obfs4 handshake", "[integration][transport][obfs4]") {
 
     NodeId node_id(server_keys->identity_key.public_key());
 
-    // Generate representable client keypair
-    auto client_kp = Elligator2::generate_representable_keypair();
-    REQUIRE(client_kp.has_value());
+    // Generate representable client keypair using obfs4_cpp
+    auto client_kp = obfs4::crypto::elligator2::generate_representable_keypair();
+    REQUIRE(client_kp.representative.has_value());
 
     // Create server handshake handler
     Obfs4ServerHandshake server_hs(node_id, server_keys->onion_key);
 
     // Build client handshake message
     auto client_hello = build_client_handshake(
-        node_id, server_keys->onion_key.public_key(), *client_kp);
+        node_id, server_keys->onion_key.public_key(), client_kp);
     REQUIRE_FALSE(client_hello.empty());
 
     // Feed client handshake to server
@@ -86,19 +97,22 @@ TEST_CASE("End-to-end obfs4 framing after handshake", "[integration][transport][
     // Simulate a completed handshake with known keys
     std::array<uint8_t, 32> send_key{}, recv_key{};
     std::array<uint8_t, 24> send_nonce{}, recv_nonce{};
+    std::array<uint8_t, 24> send_drbg{}, recv_drbg{};
     for (int i = 0; i < 32; ++i) {
         send_key[i] = static_cast<uint8_t>(i);
         recv_key[i] = static_cast<uint8_t>(i + 32);
     }
+    send_drbg[0] = 0x01;
+    recv_drbg[0] = 0x02;
 
     // Server sends with send_key, client receives with send_key (matching)
     Obfs4Framing server_framing, client_framing;
-    server_framing.init_send(send_key, send_nonce);
-    client_framing.init_recv(send_key, send_nonce);
+    server_framing.init_send(send_key, send_nonce, send_drbg);
+    client_framing.init_recv(send_key, send_nonce, send_drbg);
 
     // Client sends with recv_key, server receives with recv_key (matching)
-    client_framing.init_send(recv_key, recv_nonce);
-    server_framing.init_recv(recv_key, recv_nonce);
+    client_framing.init_send(recv_key, recv_nonce, recv_drbg);
+    server_framing.init_recv(recv_key, recv_nonce, recv_drbg);
 
     // Server -> Client
     std::vector<uint8_t> server_msg = {'S', 'e', 'r', 'v', 'e', 'r'};

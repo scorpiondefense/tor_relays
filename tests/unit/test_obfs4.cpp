@@ -51,10 +51,12 @@ TEST_CASE("Obfs4Framing encode/decode round-trip", "[unit][transport][obfs4]") {
         key[i] = static_cast<uint8_t>(i);
 
     std::array<uint8_t, 24> nonce{};
+    std::array<uint8_t, 24> drbg_seed{};
+    drbg_seed[0] = 0x01; // Non-zero seed
 
     Obfs4Framing sender, receiver;
-    sender.init_send(key, nonce);
-    receiver.init_recv(key, nonce);
+    sender.init_send(key, nonce, drbg_seed);
+    receiver.init_recv(key, nonce, drbg_seed);
 
     // Encode a frame
     std::vector<uint8_t> payload = {'H', 'e', 'l', 'l', 'o'};
@@ -72,10 +74,12 @@ TEST_CASE("Obfs4Framing multiple frames", "[unit][transport][obfs4]") {
     std::array<uint8_t, 32> key{};
     key[0] = 0x42;
     std::array<uint8_t, 24> nonce{};
+    std::array<uint8_t, 24> drbg_seed{};
+    drbg_seed[0] = 0x42;
 
     Obfs4Framing sender, receiver;
-    sender.init_send(key, nonce);
-    receiver.init_recv(key, nonce);
+    sender.init_send(key, nonce, drbg_seed);
+    receiver.init_recv(key, nonce, drbg_seed);
 
     // Encode multiple frames
     std::vector<uint8_t> payload1 = {'A', 'B', 'C'};
@@ -100,10 +104,12 @@ TEST_CASE("Obfs4Framing partial frame reassembly", "[unit][transport][obfs4]") {
     std::array<uint8_t, 32> key{};
     key[0] = 0x42;
     std::array<uint8_t, 24> nonce{};
+    std::array<uint8_t, 24> drbg_seed{};
+    drbg_seed[0] = 0x42;
 
     Obfs4Framing sender, receiver;
-    sender.init_send(key, nonce);
-    receiver.init_recv(key, nonce);
+    sender.init_send(key, nonce, drbg_seed);
+    receiver.init_recv(key, nonce, drbg_seed);
 
     std::vector<uint8_t> payload = {'T', 'e', 's', 't'};
     auto encoded = sender.encode(payload);
@@ -126,10 +132,11 @@ TEST_CASE("Obfs4Framing partial frame reassembly", "[unit][transport][obfs4]") {
 TEST_CASE("Obfs4Framing empty payload", "[unit][transport][obfs4]") {
     std::array<uint8_t, 32> key{};
     std::array<uint8_t, 24> nonce{};
+    std::array<uint8_t, 24> drbg_seed{};
 
     Obfs4Framing sender, receiver;
-    sender.init_send(key, nonce);
-    receiver.init_recv(key, nonce);
+    sender.init_send(key, nonce, drbg_seed);
+    receiver.init_recv(key, nonce, drbg_seed);
 
     std::vector<uint8_t> empty_payload;
     auto encoded = sender.encode(empty_payload);
@@ -143,10 +150,11 @@ TEST_CASE("Obfs4Framing empty payload", "[unit][transport][obfs4]") {
 TEST_CASE("Obfs4Framing max payload size", "[unit][transport][obfs4]") {
     std::array<uint8_t, 32> key{};
     std::array<uint8_t, 24> nonce{};
+    std::array<uint8_t, 24> drbg_seed{};
 
     Obfs4Framing sender, receiver;
-    sender.init_send(key, nonce);
-    receiver.init_recv(key, nonce);
+    sender.init_send(key, nonce, drbg_seed);
+    receiver.init_recv(key, nonce, drbg_seed);
 
     // Max payload
     std::vector<uint8_t> payload(OBFS4_MAX_FRAME_PAYLOAD, 0xAB);

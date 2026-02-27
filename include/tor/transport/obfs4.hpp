@@ -1,17 +1,27 @@
 #pragma once
 
-#include "tor/crypto/elligator2.hpp"
 #include "tor/crypto/keys.hpp"
 #include "tor/crypto/hash.hpp"
-#include "tor/crypto/secretbox.hpp"
 #include <array>
 #include <chrono>
 #include <cstdint>
 #include <expected>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
 #include <vector>
+
+// Forward declarations for obfs4_cpp types (avoid exposing internals)
+namespace obfs4::transport {
+class ServerHandshake;
+class Encoder;
+class Decoder;
+}
+namespace obfs4::common {
+class ReplayFilter;
+class HashDrbg;
+}
 
 namespace tor::transport {
 
@@ -24,9 +34,9 @@ constexpr size_t OBFS4_MAC_LEN = 16;           // Epoch-hour MAC (HMAC-SHA256-12
 constexpr size_t OBFS4_AUTH_LEN = 32;          // Server authentication (ntor AUTH)
 constexpr size_t OBFS4_CERT_RAW_LEN = 52;      // node_id[20] + pubkey[32]
 constexpr size_t OBFS4_MAX_HANDSHAKE_LEN = 8192; // Max bytes to buffer for handshake
-constexpr size_t OBFS4_MAX_FRAME_PAYLOAD = 1448; // Max frame payload (MTU-friendly)
+constexpr size_t OBFS4_MAX_FRAME_PAYLOAD = 1430; // Max frame payload (1448 segment - 18 overhead)
 constexpr size_t OBFS4_FRAME_HDR_LEN = 2;        // Obfuscated length (DRBG XOR)
-constexpr size_t OBFS4_FRAME_OVERHEAD = OBFS4_FRAME_HDR_LEN + crypto::Secretbox::OVERHEAD; // 2 + 16 = 18
+constexpr size_t OBFS4_FRAME_OVERHEAD = OBFS4_FRAME_HDR_LEN + 16; // 2 + poly1305 tag = 18
 constexpr size_t OBFS4_MIN_CLIENT_HANDSHAKE = OBFS4_REPR_LEN + OBFS4_MARK_LEN + OBFS4_MAC_LEN; // 64
 constexpr size_t OBFS4_MIN_SERVER_HANDSHAKE = OBFS4_REPR_LEN + OBFS4_AUTH_LEN + OBFS4_MARK_LEN + OBFS4_MAC_LEN; // 96
 
@@ -69,7 +79,8 @@ struct Obfs4Identity {
 
 // --- obfs4 Server Handshake ---
 
-// Handshake state machine for the server side of obfs4
+// Handshake state machine for the server side of obfs4.
+// Thin wrapper around obfs4::transport::ServerHandshake.
 class Obfs4ServerHandshake {
 public:
     enum class State {
@@ -82,6 +93,12 @@ public:
     Obfs4ServerHandshake(
         const crypto::NodeId& node_id,
         const crypto::Curve25519SecretKey& identity_key);
+
+    ~Obfs4ServerHandshake();
+
+    // Move-only (pimpl)
+    Obfs4ServerHandshake(Obfs4ServerHandshake&&) noexcept;
+    Obfs4ServerHandshake& operator=(Obfs4ServerHandshake&&) noexcept;
 
     // Feed incoming data. Returns:
     // - bytes consumed (may be less than input if handshake completes mid-buffer)
@@ -111,50 +128,25 @@ public:
 
 private:
     State state_{State::WaitingForMark};
-    const crypto::NodeId& node_id_;
-    const crypto::Curve25519SecretKey& identity_key_;
-
-    // Handshake buffer
-    std::vector<uint8_t> buffer_;
-
-    // Parsed from client handshake
-    std::array<uint8_t, OBFS4_REPR_LEN> client_representative_{};
-    crypto::Curve25519PublicKey client_public_key_;
-
-    // Server ephemeral key (generated during handshake)
-    std::optional<crypto::RepresentableKeypair> server_ephemeral_;
-
-    // Derived session keys
     SessionKeys session_keys_{};
 
-    // ntor AUTH value (computed during key derivation, used in server hello)
-    std::array<uint8_t, OBFS4_AUTH_LEN> auth_{};
-
-    // Build the obfs4 HMAC key: identity_pub[32] || node_id[20]
-    [[nodiscard]] std::vector<uint8_t> mac_key() const;
-
-    // Scan buffer for HMAC mark
-    [[nodiscard]] std::optional<size_t> find_mark() const;
-
-    // Verify epoch-hour MAC
-    [[nodiscard]] bool verify_epoch_mac(size_t mark_pos) const;
-
-    // Derive session keys from ntor handshake outputs
-    void derive_keys(
-        std::span<const uint8_t, 32> exp_eph,     // DH(server_eph, client_eph)
-        std::span<const uint8_t, 32> exp_id,       // DH(server_identity, client_eph)
-        const crypto::Curve25519PublicKey& server_identity_pub,
-        const crypto::Curve25519PublicKey& client_pub,
-        const crypto::Curve25519PublicKey& server_eph_pub);
+    // Pimpl: obfs4_cpp ServerHandshake + ReplayFilter
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 // --- SipHash-2-4 DRBG ---
 
 // Deterministic random bit generator using SipHash-2-4 in OFB mode.
-// Used for obfs4 frame length obfuscation per the obfs4 spec.
+// Thin wrapper around obfs4::common::HashDrbg.
 class Obfs4Drbg {
 public:
-    Obfs4Drbg() = default;
+    Obfs4Drbg();
+    ~Obfs4Drbg();
+
+    // Move-only (pimpl)
+    Obfs4Drbg(Obfs4Drbg&&) noexcept;
+    Obfs4Drbg& operator=(Obfs4Drbg&&) noexcept;
 
     // Initialize from 24-byte seed: siphash_key[16] || initial_ofb[8]
     void init(std::span<const uint8_t, 24> seed);
@@ -166,19 +158,21 @@ public:
     [[nodiscard]] uint16_t next_length_mask();
 
 private:
-    std::array<uint8_t, 16> key_{};
-    std::array<uint8_t, 8> ofb_{};
-    bool initialized_{false};
+    std::unique_ptr<obfs4::common::HashDrbg> impl_;
 };
 
 // --- obfs4 Framing ---
 
-// Encrypt/decrypt obfs4 frames per the obfs4 spec:
-// Frame = obfuscated_length[2] || secretbox_seal(payload)
-// Length is XOR'd with SipHash-2-4 DRBG output for obfuscation.
+// Encrypt/decrypt obfs4 frames per the obfs4 spec.
+// Thin wrapper around obfs4::transport::Encoder + Decoder.
 class Obfs4Framing {
 public:
-    Obfs4Framing() = default;
+    Obfs4Framing();
+    ~Obfs4Framing();
+
+    // Move-only (pimpl)
+    Obfs4Framing(Obfs4Framing&&) noexcept;
+    Obfs4Framing& operator=(Obfs4Framing&&) noexcept;
 
     // Initialize with session keys and DRBG seeds
     void init_send(std::span<const uint8_t, 32> key,
@@ -202,24 +196,8 @@ public:
     decode(std::span<const uint8_t> data);
 
 private:
-    // Send state
-    std::array<uint8_t, 32> send_key_{};
-    std::array<uint8_t, 24> send_nonce_{};
-    Obfs4Drbg send_drbg_;
-    bool send_initialized_{false};
-
-    // Receive state
-    std::array<uint8_t, 32> recv_key_{};
-    std::array<uint8_t, 24> recv_nonce_{};
-    Obfs4Drbg recv_drbg_;
-    bool recv_initialized_{false};
-
-    // Receive buffer for partial frames
-    std::vector<uint8_t> recv_buffer_;
-    std::optional<uint16_t> pending_payload_len_;
-
-    // Increment nonce (big-endian counter in last 8 bytes)
-    static void increment_nonce(std::array<uint8_t, 24>& nonce);
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 // --- Utility ---
