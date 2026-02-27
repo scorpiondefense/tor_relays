@@ -2,6 +2,7 @@
 #include "tor/crypto/key_store.hpp"
 #include "tor/modes/bridge_relay.hpp"
 #include "tor/net/acceptor.hpp"
+#include "tor/transport/obfs4_listener.hpp"
 #include "tor/util/config.hpp"
 #include "tor/util/logging.hpp"
 #include <thread>
@@ -13,6 +14,7 @@ namespace tor::core {
 struct Relay::Impl {
     boost::asio::io_context io_context;
     std::unique_ptr<net::TcpAcceptor> acceptor;
+    std::unique_ptr<transport::Obfs4Listener> obfs4_listener;
     std::jthread io_thread;
 };
 
@@ -68,14 +70,6 @@ std::expected<void, RelayError> Relay::start() {
 
         LOG_INFO("Relay fingerprint: {}", fingerprint_.to_hex());
 
-        // Log bridge line for bridge mode
-        if (config_->relay.mode == modes::RelayMode::Bridge) {
-            auto* bridge = dynamic_cast<modes::BridgeRelay*>(behavior_.get());
-            if (bridge) {
-                LOG_INFO("Bridge line: {}", bridge->bridge_line());
-            }
-        }
-
         keys_ = std::make_unique<crypto::RelayKeyPair>(std::move(*keys_result));
     }
 
@@ -93,6 +87,41 @@ std::expected<void, RelayError> Relay::start() {
         // Connection handling will be implemented as protocol layers mature
     });
 
+    // Start obfs4 listener for bridge mode with transport enabled
+    if (config_->relay.mode == modes::RelayMode::Bridge &&
+        config_->bridge.transport == "obfs4" && keys_) {
+
+        auto iat = static_cast<transport::IatMode>(config_->bridge.iat_mode);
+        impl_->obfs4_listener = std::make_unique<transport::Obfs4Listener>(
+            impl_->io_context, fingerprint_, keys_->onion_key, iat);
+        impl_->obfs4_listener->set_or_port(config_->relay.or_port);
+
+        auto obfs4_result = impl_->obfs4_listener->start(
+            "0.0.0.0", config_->bridge.transport_port);
+        if (!obfs4_result) {
+            LOG_ERROR("Failed to start obfs4 listener on port {}",
+                      config_->bridge.transport_port);
+            // Non-fatal: bridge still works on OR port without obfs4
+        } else {
+            LOG_INFO("obfs4 transport listening on port {}",
+                     config_->bridge.transport_port);
+
+            // Set obfs4 cert on bridge behavior
+            auto* bridge = dynamic_cast<modes::BridgeRelay*>(behavior_.get());
+            if (bridge) {
+                bridge->set_obfs4_cert(impl_->obfs4_listener->cert());
+            }
+        }
+    }
+
+    // Log bridge line for bridge mode
+    if (config_->relay.mode == modes::RelayMode::Bridge) {
+        auto* bridge = dynamic_cast<modes::BridgeRelay*>(behavior_.get());
+        if (bridge) {
+            LOG_INFO("Bridge line: {}", bridge->bridge_line());
+        }
+    }
+
     impl_->io_thread = std::jthread([this](std::stop_token) {
         auto work_guard = boost::asio::make_work_guard(impl_->io_context);
         impl_->io_context.run();
@@ -107,8 +136,11 @@ std::expected<void, RelayError> Relay::stop() {
         return std::unexpected(RelayError::NotRunning);
     }
 
-    // Stop acceptor and io_context
+    // Stop obfs4 listener and acceptor
     if (impl_) {
+        if (impl_->obfs4_listener) {
+            impl_->obfs4_listener->stop();
+        }
         if (impl_->acceptor) {
             impl_->acceptor->close();
         }

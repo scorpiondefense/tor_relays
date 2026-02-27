@@ -136,10 +136,22 @@ std::string BridgeRelay::bridge_line() const {
     if (address.empty()) {
         address = "0.0.0.0";
     }
-    oss << address << ":" << config_->relay.or_port;
+
+    // Use transport port for obfs4, OR port for plain bridge
+    if (transport_name_ == "obfs4" && config_->bridge.transport_port > 0) {
+        oss << address << ":" << config_->bridge.transport_port;
+    } else {
+        oss << address << ":" << config_->relay.or_port;
+    }
 
     if (!fingerprint_hex.empty()) {
         oss << " " << fingerprint_hex;
+    }
+
+    // Append obfs4 cert and iat-mode
+    if (transport_name_ == "obfs4" && obfs4_cert_) {
+        oss << " cert=" << *obfs4_cert_;
+        oss << " iat-mode=" << static_cast<int>(config_->bridge.iat_mode);
     }
 
     return oss.str();

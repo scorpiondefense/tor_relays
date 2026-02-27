@@ -3,6 +3,7 @@
 #include "tor/modes/relay_behavior.hpp"
 #include "tor/core/channel.hpp"
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace tor::modes {
@@ -73,6 +74,10 @@ public:
     void set_transport(const std::string& transport) { transport_name_ = transport; }
     [[nodiscard]] const std::string& transport() const { return transport_name_; }
 
+    // obfs4 cert support
+    void set_obfs4_cert(const std::string& cert) { obfs4_cert_ = cert; }
+    [[nodiscard]] const std::optional<std::string>& obfs4_cert() const { return obfs4_cert_; }
+
     // Bridge authority publishing
     void set_bridge_authority(const std::string& address) { bridge_authority_ = address; }
     [[nodiscard]] const std::string& bridge_authority() const { return bridge_authority_; }
@@ -85,6 +90,7 @@ private:
     Distribution distribution_{Distribution::None};
     std::string transport_name_;
     std::string bridge_authority_;
+    std::optional<std::string> obfs4_cert_;
     std::shared_ptr<core::ChannelManager> channel_manager_;
 
     // Statistics

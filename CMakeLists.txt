@@ -70,6 +70,11 @@ set(TOR_SOURCES
     src/modes/exit_relay.cpp
     src/modes/bridge_relay.cpp
     src/modes/guard_relay.cpp
+    src/crypto/field25519.cpp
+    src/crypto/elligator2.cpp
+    src/crypto/secretbox.cpp
+    src/transport/obfs4.cpp
+    src/transport/obfs4_listener.cpp
     src/util/config.cpp
     src/util/logging.cpp
 )
@@ -121,9 +126,14 @@ if(BUILD_TESTING)
         tests/unit/test_config.cpp
         tests/unit/test_guard_relay.cpp
         tests/unit/test_key_store.cpp
+        tests/unit/test_field25519.cpp
+        tests/unit/test_elligator2.cpp
+        tests/unit/test_secretbox.cpp
+        tests/unit/test_obfs4.cpp
         tests/integration/test_tls.cpp
         tests/integration/test_circuit_creation.cpp
         tests/integration/test_directory.cpp
+        tests/integration/test_obfs4_transport.cpp
     )
 
     add_executable(tor_tests ${TEST_SOURCES})

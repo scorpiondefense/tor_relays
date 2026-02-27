@@ -61,6 +61,8 @@ struct BridgeConfig {
     std::string transport;           // Pluggable transport (e.g., "obfs4")
     std::string bridge_authority;    // Bridge authority address
     std::string server_transport_plugin;  // Path to transport plugin
+    uint16_t transport_port{443};    // Port for pluggable transport (e.g., obfs4)
+    uint8_t iat_mode{0};            // IAT obfuscation mode (0=off, 1=enabled, 2=paranoid)
 };
 
 // Guard-specific configuration

@@ -75,7 +75,7 @@ USER tor
 # 9001 - OR port (main relay port)
 # 9030 - Directory port (optional)
 # 9090 - Metrics port (optional)
-EXPOSE 9001 9030 9090
+EXPOSE 443 9001 9030 9090
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \

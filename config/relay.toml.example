@@ -94,9 +94,16 @@ distribution = "https"
 
 # Pluggable transport (optional, for obfuscation)
 [bridge.transport]
-enabled = false
+enabled = true
 type = "obfs4"
-bind_address = "0.0.0.0:9002"
+# Port for the obfs4 transport listener
+# 443 mimics HTTPS traffic, making it harder to block
+port = 443
+# IAT (Inter-Arrival Time) obfuscation mode:
+#   0 = Off (no padding)
+#   1 = Enabled (add random padding to packets)
+#   2 = Paranoid (add random padding + timing jitter)
+iat_mode = 0
 
 # ─────────────────────────────────────────────────────────────
 # DIRECTORY SETTINGS
