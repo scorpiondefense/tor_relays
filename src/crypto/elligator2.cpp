@@ -39,7 +39,7 @@ FieldElement Elligator2::map_to_u(const FieldElement& r) {
     auto rhs = v3 + A * v2 + v;            // v^3 + A*v^2 + v
 
     // Check if rhs is a square (Euler criterion)
-    auto [root, is_square] = rhs.sqrt();
+    auto [_, is_square] = rhs.sqrt();
 
     // If is_square: x = v
     // Else: x = -v - A
@@ -80,7 +80,6 @@ std::optional<FieldElement> Elligator2::u_to_representative(const FieldElement& 
     // Additionally, x must not be 0 and x must be on the curve (first branch).
 
     auto A = FieldElement::A();
-    auto one = FieldElement::one();
 
     // x must not be zero
     if (u_coord.is_zero()) {
@@ -156,14 +155,12 @@ FieldElement Elligator2::scalar_base_mult(std::span<const uint8_t, 32> scalar) {
     // Montgomery ladder scalar multiplication on Curve25519
     // Basepoint u = 9
     auto u = FieldElement(9, 0, 0, 0, 0);
-    auto one = FieldElement::one();
-    auto A = FieldElement::A();
 
     // Montgomery ladder
-    auto x_0 = one;       // u-coordinate of 0*G = point at infinity
+    auto x_0 = FieldElement::one();  // u-coordinate of 0*G = point at infinity
     auto x_1 = u;         // u-coordinate of 1*G = basepoint
     auto z_0 = FieldElement::zero();
-    auto z_1 = one;
+    auto z_1 = FieldElement::one();
 
     // Process bits from high to low
     for (int i = 254; i >= 0; --i) {
