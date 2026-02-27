@@ -1,4 +1,8 @@
 # Multi-stage build for Tor Relay
+# Build context: monorepo root (parent of tor_relays/)
+# Usage: docker build -f tor_relays/Dockerfile .
+# Or:    docker build -f infrastructure/docker/Dockerfile.tor-relays .
+
 # Stage 1: Build
 FROM ubuntu:24.04 AS builder
 
@@ -21,21 +25,26 @@ RUN pip3 install --break-system-packages conan
 # Create build directory
 WORKDIR /build
 
-# Copy source files
-COPY CMakeLists.txt conanfile.txt ./
-COPY include/ include/
-COPY src/ src/
-COPY tests/ tests/
-COPY cmake/ cmake/
+# Copy obfs4_cpp library (dependency)
+COPY obfs4_cpp/ obfs4_cpp/
+
+# Copy tor_relays source files
+COPY tor_relays/CMakeLists.txt tor_relays/
+COPY tor_relays/conanfile.txt tor_relays/
+COPY tor_relays/include/ tor_relays/include/
+COPY tor_relays/src/ tor_relays/src/
+COPY tor_relays/tests/ tor_relays/tests/
+COPY tor_relays/cmake/ tor_relays/cmake/
 
 # Setup Conan profile
 RUN conan profile detect
 
 # Install dependencies
+WORKDIR /build/tor_relays
 RUN conan install . --build=missing --output-folder=build
 
 # Build the project
-WORKDIR /build/build
+WORKDIR /build/tor_relays/build
 RUN cmake .. \
     -DCMAKE_TOOLCHAIN_FILE=conan_toolchain.cmake \
     -DCMAKE_BUILD_TYPE=Release \
@@ -55,14 +64,14 @@ RUN apt-get update && apt-get install -y \
     && useradd -r -s /bin/false tor
 
 # Copy binary from builder
-COPY --from=builder /build/build/tor_relay /usr/local/bin/
+COPY --from=builder /build/tor_relays/build/tor_relay /usr/local/bin/
 
 # Create data directories
 RUN mkdir -p /var/lib/tor/keys /var/log/tor /etc/tor \
     && chown -R tor:tor /var/lib/tor /var/log/tor
 
 # Copy default configuration
-COPY config/relay.toml.example /etc/tor/relay.toml
+COPY tor_relays/config/relay.toml.example /etc/tor/relay.toml
 
 # Set permissions
 RUN chmod 700 /var/lib/tor \
