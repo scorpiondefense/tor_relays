@@ -5,6 +5,10 @@
 #include "tor/crypto/hash.hpp"
 #include "obfs4/crypto/elligator2.hpp"
 #include "obfs4/common/ntor.hpp"
+#include "obfs4/transport/packet.hpp"
+#include "obfs4/transport/handshake.hpp"
+#include "obfs4/transport/conn.hpp"
+#include "obfs4/common/csrand.hpp"
 #include <cstring>
 
 using namespace tor::transport;
@@ -129,6 +133,141 @@ TEST_CASE("End-to-end obfs4 framing after handshake", "[integration][transport][
     REQUIRE(decoded2.has_value());
     REQUIRE(decoded2->frames.size() == 1);
     REQUIRE(decoded2->frames[0] == client_msg);
+}
+
+TEST_CASE("Full obfs4 flow with seed frame (simulates Tor Browser)", "[integration][transport][obfs4]") {
+    // This test simulates the exact flow between our C++ bridge server
+    // and the Go lyrebird/obfs4proxy client used by Tor Browser:
+    //
+    // 1. Server generates identity keypair
+    // 2. Client sends: repr[32] || padding || mark[16] || mac[16]
+    // 3. Server responds: repr[32] || auth[32] || padding || mark[16] || mac[16] || seed_frame[45]
+    // 4. Client parses response, decodes seed frame, initializes connection
+    // 5. Both sides exchange data through packet layer
+
+    // --- Setup server identity ---
+    auto id_kp = obfs4::crypto::elligator2::generate_representable_keypair();
+    REQUIRE(id_kp.representative.has_value());
+
+    obfs4::common::NodeID node_id{};
+    for (int i = 0; i < 20; ++i) node_id[i] = static_cast<uint8_t>(i + 42);
+
+    obfs4::common::ReplayFilter replay_filter;
+
+    // --- Client handshake ---
+    obfs4::transport::ClientHandshake client_hs(id_kp.public_key, node_id);
+    auto client_hello = client_hs.generate();
+    REQUIRE(!client_hello.empty());
+
+    // --- Server handshake: consume + generate ---
+    obfs4::transport::ServerHandshake server_hs(id_kp, node_id, replay_filter);
+    auto consume_result = server_hs.consume(client_hello);
+    REQUIRE(consume_result.has_value());
+    REQUIRE(server_hs.completed());
+
+    auto server_hello = server_hs.generate();
+    REQUIRE(server_hello.has_value());
+
+    // --- Server side: use a SINGLE encoder for seed frame + all subsequent data ---
+    // This mirrors the listener where Obfs4Framing::encode is used for the seed
+    // frame first (counter 1), then for all proxy data (counter 2, 3, ...).
+    auto& server_keys = server_hs.keys();
+    obfs4::transport::Encoder server_encoder;
+    server_encoder.init(
+        std::span<const uint8_t, 32>(server_keys.encoder_key_material.data(), 32),
+        std::span<const uint8_t, 16>(server_keys.encoder_key_material.data() + 32, 16),
+        std::span<const uint8_t, 24>(server_keys.encoder_key_material.data() + 48, 24));
+
+    obfs4::transport::Decoder server_decoder;
+    server_decoder.init(
+        std::span<const uint8_t, 32>(server_keys.decoder_key_material.data(), 32),
+        std::span<const uint8_t, 16>(server_keys.decoder_key_material.data() + 32, 16),
+        std::span<const uint8_t, 24>(server_keys.decoder_key_material.data() + 48, 24));
+
+    // Encode the inline seed frame (counter 1 → 2)
+    auto seed_bytes = obfs4::common::random_bytes(24);
+    auto seed_pkt = obfs4::transport::make_packet(
+        obfs4::transport::PacketType::PrngSeed,
+        std::span<const uint8_t>(seed_bytes.data(), seed_bytes.size()));
+    auto seed_frame = server_encoder.encode(
+        std::span<const uint8_t>(seed_pkt.data(), seed_pkt.size()));
+
+    // Seed frame should be exactly 45 bytes
+    REQUIRE(seed_frame.size() == obfs4::transport::INLINE_SEED_FRAME_LENGTH);
+
+    // Append seed frame to server hello
+    server_hello->insert(server_hello->end(), seed_frame.begin(), seed_frame.end());
+
+    // --- Client parses server response ---
+    auto parse_result = client_hs.parse_server_response(*server_hello);
+    REQUIRE(parse_result.has_value());
+    auto [consumed, drbg_seed] = *parse_result;
+    REQUIRE(consumed > 0);
+
+    // --- Client side: use Obfs4Conn for packet-layer handling ---
+    auto& client_keys = client_hs.keys();
+    obfs4::transport::Obfs4Conn client_conn;
+    client_conn.init(
+        std::span<const uint8_t, 72>(client_keys.encoder_key_material.data(), 72),
+        std::span<const uint8_t, 72>(client_keys.decoder_key_material.data(), 72));
+
+    // Client processes remaining bytes (seed frame) through its decoder
+    auto remaining = std::span<const uint8_t>(
+        server_hello->data() + consumed, server_hello->size() - consumed);
+    if (!remaining.empty()) {
+        auto seed_read = client_conn.read(remaining);
+        REQUIRE(seed_read.has_value());
+        // PrngSeed packet: no plaintext output, seed handled internally
+        REQUIRE(seed_read->plaintext.empty());
+    }
+
+    // --- Client → Server data exchange (simulates Tor VERSIONS cell) ---
+    std::vector<uint8_t> versions_cell(512);
+    for (size_t i = 0; i < versions_cell.size(); ++i)
+        versions_cell[i] = static_cast<uint8_t>(i & 0xff);
+
+    auto wire = client_conn.write(versions_cell);
+    REQUIRE(!wire.empty());
+
+    // Server decodes using its decoder and parses packets
+    auto decode_result = server_decoder.decode(wire);
+    REQUIRE(decode_result.has_value());
+    std::vector<uint8_t> server_plaintext;
+    for (auto& frame : decode_result->frames) {
+        auto pkts = obfs4::transport::parse_packets(frame.payload);
+        for (auto& p : pkts) {
+            if (p.type == obfs4::transport::PacketType::Payload) {
+                server_plaintext.insert(server_plaintext.end(),
+                                        p.payload.begin(), p.payload.end());
+            }
+        }
+    }
+    REQUIRE(server_plaintext == versions_cell);
+
+    // --- Server → Client (simulates OR response, uses same encoder at counter 2+) ---
+    std::vector<uint8_t> or_response(1024);
+    for (size_t i = 0; i < or_response.size(); ++i)
+        or_response[i] = static_cast<uint8_t>((i + 128) & 0xff);
+
+    // Server wraps in packets and encodes, splitting if needed
+    std::vector<uint8_t> reply_wire;
+    constexpr size_t max_chunk = obfs4::transport::MAX_FRAME_PAYLOAD
+                                - obfs4::transport::PACKET_OVERHEAD;
+    size_t offset = 0;
+    while (offset < or_response.size()) {
+        size_t chunk_len = std::min(or_response.size() - offset, max_chunk);
+        auto chunk = std::span<const uint8_t>(or_response.data() + offset, chunk_len);
+        auto pkt = obfs4::transport::make_packet(
+            obfs4::transport::PacketType::Payload, chunk);
+        auto frame = server_encoder.encode(
+            std::span<const uint8_t>(pkt.data(), pkt.size()));
+        reply_wire.insert(reply_wire.end(), frame.begin(), frame.end());
+        offset += chunk_len;
+    }
+
+    auto client_read = client_conn.read(reply_wire);
+    REQUIRE(client_read.has_value());
+    REQUIRE(client_read->plaintext == or_response);
 }
 
 TEST_CASE("obfs4 cert generation and bridge line", "[integration][transport][obfs4]") {
