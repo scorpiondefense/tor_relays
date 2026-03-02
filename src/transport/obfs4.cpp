@@ -83,17 +83,14 @@ static Obfs4ServerHandshake::SessionKeys extract_session_keys(
 
     // Server send = encoder_key_material
     std::memcpy(sk.send_key.data(), hk.encoder_key_material.data(), 32);
-    // Build send nonce: prefix[16] || counter[8] with counter=1
+    // Nonce prefix: bytes [32:48] (counter is managed by the framing layer)
     std::memcpy(sk.send_nonce.data(), hk.encoder_key_material.data() + 32, 16);
-    sk.send_nonce[23] = 1; // Big-endian counter starts at 1
     // DRBG seed for send: bytes [48:72]
     std::memcpy(sk.send_drbg_seed.data(), hk.encoder_key_material.data() + 48, 24);
 
     // Server recv = decoder_key_material
     std::memcpy(sk.recv_key.data(), hk.decoder_key_material.data(), 32);
-    // Build recv nonce: prefix[16] || counter[8] with counter=1
     std::memcpy(sk.recv_nonce.data(), hk.decoder_key_material.data() + 32, 16);
-    sk.recv_nonce[23] = 1;
     // DRBG seed for recv: bytes [48:72]
     std::memcpy(sk.recv_drbg_seed.data(), hk.decoder_key_material.data() + 48, 24);
 

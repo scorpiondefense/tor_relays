@@ -89,6 +89,11 @@ void Obfs4Listener::handle_connection(std::shared_ptr<net::TcpConnection> conn) 
         auto buffer = std::array<uint8_t, 8192>{};
 
         // --- Phase 1: Handshake ---
+        // Track bytes fed to detect leftover post-handshake data in the TCP read.
+        size_t total_fed_before = 0;
+        size_t last_bytes_read = 0;
+        size_t last_consumed = 0;
+
         while (true) {
             auto bytes_read = conn->read(
                 std::span<uint8_t>(buffer.data(), buffer.size()));
@@ -99,22 +104,12 @@ void Obfs4Listener::handle_connection(std::shared_ptr<net::TcpConnection> conn) 
                 return;
             }
 
+            last_bytes_read = *bytes_read;
             LOG_INFO("obfs4 handshake: received {} bytes", *bytes_read);
 
-            // Debug: hex dump first 48 bytes to identify protocol
-            {
-                size_t dump_len = std::min<size_t>(*bytes_read, 48);
-                std::ostringstream hex;
-                for (size_t i = 0; i < dump_len; ++i)
-                    hex << std::hex << std::setfill('0') << std::setw(2)
-                        << static_cast<int>(buffer[i]);
-                LOG_INFO("obfs4 handshake: first {} bytes hex: {}", dump_len, hex.str());
-
-                // Detect TLS ClientHello (starts with 0x16 0x03)
-                if (*bytes_read >= 3 && buffer[0] == 0x16 &&
-                    buffer[1] == 0x03) {
-                    LOG_WARN("obfs4 handshake: received TLS ClientHello, not obfs4 data");
-                }
+            // Detect TLS ClientHello (starts with 0x16 0x03)
+            if (*bytes_read >= 3 && buffer[0] == 0x16 && buffer[1] == 0x03) {
+                LOG_WARN("obfs4 handshake: received TLS ClientHello, not obfs4 data");
             }
 
             auto data = std::span<const uint8_t>(buffer.data(), *bytes_read);
@@ -127,12 +122,32 @@ void Obfs4Listener::handle_connection(std::shared_ptr<net::TcpConnection> conn) 
             }
 
             if (handshake->state() == Obfs4ServerHandshake::State::Completed) {
+                last_consumed = *consume_result;
                 break;
             }
             if (handshake->state() == Obfs4ServerHandshake::State::Failed) {
                 stats_failed->fetch_add(1, std::memory_order_relaxed);
                 return;
             }
+
+            total_fed_before += *bytes_read;
+        }
+
+        // Compute leftover bytes: TCP read may contain post-handshake framed data.
+        // last_consumed = mac_end position in the accumulated internal buffer.
+        std::vector<uint8_t> leftover;
+        if (last_consumed > total_fed_before) {
+            size_t consumed_from_last = last_consumed - total_fed_before;
+            if (consumed_from_last < last_bytes_read) {
+                leftover.assign(
+                    buffer.data() + consumed_from_last,
+                    buffer.data() + last_bytes_read);
+            }
+        } else {
+            leftover.assign(buffer.data(), buffer.data() + last_bytes_read);
+        }
+        if (!leftover.empty()) {
+            LOG_INFO("obfs4: {} bytes of post-handshake data in TCP buffer", leftover.size());
         }
 
         // --- Phase 2: Initialize framing and send server hello + seed frame ---
@@ -186,6 +201,36 @@ void Obfs4Listener::handle_connection(std::shared_ptr<net::TcpConnection> conn) 
         }
 
         LOG_INFO("obfs4: connected to local OR port {}, starting proxy", local_or_port);
+
+        // Feed any leftover handshake bytes to the framing decoder.
+        // This handles the case where a TCP read contained both handshake
+        // and post-handshake framed data in the same segment.
+        if (!leftover.empty()) {
+            auto frames = framing->decode(
+                std::span<const uint8_t>(leftover.data(), leftover.size()));
+            if (!frames) {
+                LOG_WARN("obfs4: failed to decode leftover data: {}",
+                         obfs4_error_message(frames.error()));
+            } else {
+                for (const auto& frame_payload : frames->frames) {
+                    auto packets = obfs4::transport::parse_packets(
+                        std::span<const uint8_t>(frame_payload.data(),
+                                                 frame_payload.size()));
+                    for (const auto& pkt : packets) {
+                        if (pkt.type == obfs4::transport::PacketType::Payload
+                            && !pkt.payload.empty()) {
+                            auto wr = or_conn->write(
+                                std::span<const uint8_t>(pkt.payload.data(),
+                                                         pkt.payload.size()));
+                            if (!wr) {
+                                LOG_WARN("obfs4: failed to forward leftover to OR");
+                            }
+                        }
+                    }
+                }
+                LOG_INFO("obfs4: processed {} leftover bytes", leftover.size());
+            }
+        }
 
         // --- Phase 4: Full-duplex bidirectional proxy ---
         // Two threads: one for each direction.
