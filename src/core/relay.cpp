@@ -66,7 +66,7 @@ std::expected<void, RelayError> Relay::start() {
             return std::unexpected(RelayError::KeyGenerationFailed);
         }
 
-        fingerprint_ = crypto::NodeId(keys_result->rsa_identity.public_key_der());
+        fingerprint_ = crypto::NodeId(keys_result->rsa_identity.rsa_public_key_der());
 
         auto fp_result = key_store.write_fingerprint(
             config_->relay.nickname, fingerprint_);

@@ -521,6 +521,29 @@ std::vector<uint8_t> Rsa1024Identity::public_key_der() const {
     return der;
 }
 
+std::vector<uint8_t> Rsa1024Identity::rsa_public_key_der() const {
+    if (!pkey_) return {};
+    // Extract raw RSA public key (PKCS#1 RSAPublicKey format).
+    // Tor uses i2d_RSAPublicKey for fingerprint: SHA1(i2d_RSAPublicKey(rsa)).
+    // The deprecated RSA API is needed because EVP_PKEY doesn't have an
+    // equivalent that outputs PKCS#1 RSAPublicKey (without AlgorithmIdentifier).
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    RSA* rsa = EVP_PKEY_get1_RSA(pkey_);
+    if (!rsa) return {};
+    int len = i2d_RSAPublicKey(rsa, nullptr);
+    if (len <= 0) {
+        RSA_free(rsa);
+        return {};
+    }
+    std::vector<uint8_t> der(static_cast<size_t>(len));
+    unsigned char* p = der.data();
+    i2d_RSAPublicKey(rsa, &p);
+    RSA_free(rsa);
+#pragma GCC diagnostic pop
+    return der;
+}
+
 std::expected<std::vector<uint8_t>, KeyError>
 Rsa1024Identity::sign_sha256(std::span<const uint8_t> data) const {
     if (!pkey_) {

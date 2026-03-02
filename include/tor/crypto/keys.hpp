@@ -173,6 +173,10 @@ public:
     [[nodiscard]] std::vector<uint8_t> private_key_der() const;
     [[nodiscard]] std::vector<uint8_t> public_key_der() const;
 
+    // Raw RSA public key DER (PKCS#1 RSAPublicKey, without AlgorithmIdentifier)
+    // Used for Tor fingerprint computation: SHA1(i2d_RSAPublicKey)
+    [[nodiscard]] std::vector<uint8_t> rsa_public_key_der() const;
+
     // RSA-PKCS1v1.5-SHA256 signature
     [[nodiscard]] std::expected<std::vector<uint8_t>, KeyError>
     sign_sha256(std::span<const uint8_t> data) const;
