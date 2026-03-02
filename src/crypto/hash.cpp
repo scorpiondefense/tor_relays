@@ -365,14 +365,21 @@ hkdf_sha256(
         return std::unexpected(HashError::OpenSSLError);
     }
 
+    // OpenSSL requires non-NULL pointers for octet string params,
+    // even when the length is 0. Use a dummy byte for empty spans.
+    uint8_t dummy = 0;
+    auto safe_ptr = [&](std::span<const uint8_t> s) -> uint8_t* {
+        return s.empty() ? &dummy : const_cast<uint8_t*>(s.data());
+    };
+
     OSSL_PARAM params[5];
     params[0] = OSSL_PARAM_construct_utf8_string("digest", const_cast<char*>("SHA256"), 0);
     params[1] = OSSL_PARAM_construct_octet_string("key",
-        const_cast<uint8_t*>(ikm.data()), ikm.size());
+        safe_ptr(ikm), ikm.size());
     params[2] = OSSL_PARAM_construct_octet_string("salt",
-        const_cast<uint8_t*>(salt.data()), salt.size());
+        safe_ptr(salt), salt.size());
     params[3] = OSSL_PARAM_construct_octet_string("info",
-        const_cast<uint8_t*>(info.data()), info.size());
+        safe_ptr(info), info.size());
     params[4] = OSSL_PARAM_construct_end();
 
     std::vector<uint8_t> output(length);

@@ -147,6 +147,8 @@ DescriptorBuilder& DescriptorBuilder::hidden_service_dir(bool enabled) {
 ServerDescriptor DescriptorBuilder::build() const {
     ServerDescriptor result = desc_;
     result.published = std::chrono::system_clock::now();
+    // Compute fingerprint as SHA-1 of the identity key
+    result.fingerprint = crypto::NodeId(result.identity_key);
     return result;
 }
 
