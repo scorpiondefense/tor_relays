@@ -18,6 +18,10 @@ namespace tor::net {
 class TlsConnection;
 }
 
+namespace tor::protocol {
+class CellReader;
+}
+
 namespace tor::core {
 
 // Forward declarations
@@ -70,7 +74,10 @@ public:
 
     // Link protocol version
     [[nodiscard]] uint16_t link_version() const { return link_version_; }
-    void set_link_version(uint16_t version) { link_version_ = version; }
+    void set_link_version(uint16_t version);
+
+    // Connection-backed I/O
+    void set_connection(std::shared_ptr<net::TlsConnection> conn);
 
     // Send a fixed-size cell
     [[nodiscard]] std::expected<void, ChannelError> send(const Cell& cell);
@@ -78,11 +85,26 @@ public:
     // Send a variable-length cell
     [[nodiscard]] std::expected<void, ChannelError> send(const VariableCell& cell);
 
-    // Receive a cell (blocking)
+    // Receive a fixed-size cell (blocking)
     [[nodiscard]] std::expected<Cell, ChannelError> receive();
+
+    // Receive a variable-length cell (blocking)
+    [[nodiscard]] std::expected<VariableCell, ChannelError> receive_variable();
+
+    // Receive any cell type (fixed or variable)
+    struct AnyCell {
+        bool is_variable;
+        Cell fixed_cell;
+        VariableCell variable_cell;
+    };
+    [[nodiscard]] std::expected<AnyCell, ChannelError> receive_any();
 
     // Close the channel
     void close();
+
+    // TLS certificate (DER encoded) for CERTS cell
+    [[nodiscard]] const std::vector<uint8_t>& tls_cert_der() const { return tls_cert_der_; }
+    void set_tls_cert_der(std::vector<uint8_t> der) { tls_cert_der_ = std::move(der); }
 
     // Circuit table for this channel
     [[nodiscard]] std::shared_ptr<CircuitTable> circuit_table() const { return circuit_table_; }
@@ -124,6 +146,11 @@ private:
 
     mutable std::mutex send_mutex_;
     mutable std::mutex recv_mutex_;
+
+    // Connection-backed I/O
+    std::shared_ptr<net::TlsConnection> connection_;
+    std::vector<uint8_t> tls_cert_der_;
+    std::unique_ptr<protocol::CellReader> cell_reader_;
 };
 
 // Channel manager: manages TLS connections to other relays

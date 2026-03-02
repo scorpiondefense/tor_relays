@@ -1,5 +1,8 @@
 #include "tor/core/channel.hpp"
 #include "tor/core/circuit.hpp"
+#include "tor/net/connection.hpp"
+#include "tor/protocol/cell_parser.hpp"
+#include "tor/util/logging.hpp"
 
 namespace tor::core {
 
@@ -12,48 +15,173 @@ Channel::~Channel() {
     close();
 }
 
+void Channel::set_link_version(uint16_t version) {
+    link_version_ = version;
+    if (cell_reader_) {
+        cell_reader_->set_link_version(version);
+    }
+}
+
+void Channel::set_connection(std::shared_ptr<net::TlsConnection> conn) {
+    connection_ = std::move(conn);
+    // Start with link_version 3 (2-byte circuit IDs) for VERSIONS negotiation
+    link_version_ = 3;
+    cell_reader_ = std::make_unique<protocol::CellReader>(link_version_);
+}
+
 std::expected<void, ChannelError> Channel::send(const Cell& cell) {
+    std::lock_guard lock(send_mutex_);
+
+    if (connection_) {
+        protocol::CellParser parser(link_version_);
+        auto bytes = parser.serialize_cell(cell);
+        auto result = connection_->write(
+            std::span<const uint8_t>(bytes.data(), bytes.size()));
+        if (!result) {
+            return std::unexpected(ChannelError::SendFailed);
+        }
+        ++cells_sent_;
+        bytes_sent_ += core::CELL_LEN;
+        return {};
+    }
+
+    // Stub behavior (no connection)
     if (state_ != ChannelState::Open) {
         return std::unexpected(ChannelError::NotConnected);
     }
-
-    std::lock_guard lock(send_mutex_);
-
-    // In a full implementation, this would serialize the cell and write
-    // to the TLS connection. For now, track statistics.
     ++cells_sent_;
     bytes_sent_ += CELL_LEN;
-
     return {};
 }
 
 std::expected<void, ChannelError> Channel::send(const VariableCell& cell) {
+    std::lock_guard lock(send_mutex_);
+
+    if (connection_) {
+        protocol::CellParser parser(link_version_);
+        auto bytes = parser.serialize_variable_cell(cell);
+        auto result = connection_->write(
+            std::span<const uint8_t>(bytes.data(), bytes.size()));
+        if (!result) {
+            return std::unexpected(ChannelError::SendFailed);
+        }
+        ++cells_sent_;
+        bytes_sent_ += bytes.size();
+        return {};
+    }
+
+    // Stub behavior
     if (state_ != ChannelState::Open) {
         return std::unexpected(ChannelError::NotConnected);
     }
-
-    std::lock_guard lock(send_mutex_);
-
     ++cells_sent_;
-    bytes_sent_ += CELL_HEADER_LEN + 2 + cell.payload_length();  // +2 for length field
-
+    bytes_sent_ += CELL_HEADER_LEN + 2 + cell.payload_length();
     return {};
 }
 
 std::expected<Cell, ChannelError> Channel::receive() {
+    std::lock_guard lock(recv_mutex_);
+
+    if (connection_ && cell_reader_) {
+        auto buf = std::array<uint8_t, 4096>{};
+        while (!cell_reader_->has_cell()) {
+            auto result = connection_->read(
+                std::span<uint8_t>(buf.data(), buf.size()));
+            if (!result || *result == 0) {
+                return std::unexpected(ChannelError::ReceiveFailed);
+            }
+            cell_reader_->feed(std::span<const uint8_t>(buf.data(), *result));
+        }
+
+        auto cell = cell_reader_->take_cell();
+        if (!cell) {
+            return std::unexpected(ChannelError::ReceiveFailed);
+        }
+        ++cells_received_;
+        bytes_received_ += core::CELL_LEN;
+        return *cell;
+    }
+
+    // Stub behavior
     if (state_ != ChannelState::Open) {
         return std::unexpected(ChannelError::NotConnected);
     }
+    return std::unexpected(ChannelError::ReceiveFailed);
+}
 
+std::expected<VariableCell, ChannelError> Channel::receive_variable() {
     std::lock_guard lock(recv_mutex_);
 
-    // In a full implementation, this would read from the TLS connection
-    // and deserialize. For now, return an error.
-    return std::unexpected(ChannelError::ReceiveFailed);
+    if (!connection_ || !cell_reader_) {
+        return std::unexpected(ChannelError::NotConnected);
+    }
+
+    auto buf = std::array<uint8_t, 4096>{};
+    while (!cell_reader_->has_cell()) {
+        auto result = connection_->read(
+            std::span<uint8_t>(buf.data(), buf.size()));
+        if (!result || *result == 0) {
+            return std::unexpected(ChannelError::ReceiveFailed);
+        }
+        cell_reader_->feed(std::span<const uint8_t>(buf.data(), *result));
+    }
+
+    auto cell = cell_reader_->take_variable_cell();
+    if (!cell) {
+        return std::unexpected(ChannelError::ReceiveFailed);
+    }
+    ++cells_received_;
+    bytes_received_ += 5 + 2 + cell->payload.size();
+    return std::move(*cell);
+}
+
+std::expected<Channel::AnyCell, ChannelError> Channel::receive_any() {
+    std::lock_guard lock(recv_mutex_);
+
+    if (!connection_ || !cell_reader_) {
+        return std::unexpected(ChannelError::NotConnected);
+    }
+
+    auto buf = std::array<uint8_t, 4096>{};
+    while (!cell_reader_->has_cell()) {
+        auto result = connection_->read(
+            std::span<uint8_t>(buf.data(), buf.size()));
+        if (!result || *result == 0) {
+            return std::unexpected(ChannelError::ReceiveFailed);
+        }
+        cell_reader_->feed(std::span<const uint8_t>(buf.data(), *result));
+    }
+
+    auto header = cell_reader_->peek_header();
+    if (!header) {
+        return std::unexpected(ChannelError::ReceiveFailed);
+    }
+
+    AnyCell any{};
+    if (is_variable_length_command(header->command)) {
+        auto cell = cell_reader_->take_variable_cell();
+        if (!cell) return std::unexpected(ChannelError::ReceiveFailed);
+        any.is_variable = true;
+        any.variable_cell = std::move(*cell);
+        ++cells_received_;
+        bytes_received_ += 5 + 2 + any.variable_cell.payload.size();
+    } else {
+        auto cell = cell_reader_->take_cell();
+        if (!cell) return std::unexpected(ChannelError::ReceiveFailed);
+        any.is_variable = false;
+        any.fixed_cell = std::move(*cell);
+        ++cells_received_;
+        bytes_received_ += core::CELL_LEN;
+    }
+
+    return any;
 }
 
 void Channel::close() {
     state_ = ChannelState::Closed;
+    if (connection_) {
+        connection_->close();
+    }
 }
 
 // --- ChannelManager ---

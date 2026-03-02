@@ -202,13 +202,14 @@ public:
     // Get buffered data size
     [[nodiscard]] size_t buffered() const { return buffer_.size(); }
 
+    // Peek at next cell header without consuming
+    [[nodiscard]] std::expected<CellParser::CellHeader, CellParserError>
+    peek_header() const;
+
 private:
     CellParser parser_;
     std::vector<uint8_t> buffer_;
     uint16_t link_version_{4};
-
-    [[nodiscard]] std::expected<CellParser::CellHeader, CellParserError>
-    peek_header() const;
 };
 
 // Utility

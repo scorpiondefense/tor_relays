@@ -5,6 +5,8 @@
 #include "obfs4/common/csrand.hpp"
 #include <cstring>
 #include <thread>
+#include <sstream>
+#include <iomanip>
 
 namespace tor::transport {
 
@@ -99,6 +101,22 @@ void Obfs4Listener::handle_connection(std::shared_ptr<net::TcpConnection> conn) 
 
             LOG_INFO("obfs4 handshake: received {} bytes", *bytes_read);
 
+            // Debug: hex dump first 48 bytes to identify protocol
+            {
+                size_t dump_len = std::min<size_t>(*bytes_read, 48);
+                std::ostringstream hex;
+                for (size_t i = 0; i < dump_len; ++i)
+                    hex << std::hex << std::setfill('0') << std::setw(2)
+                        << static_cast<int>(buffer[i]);
+                LOG_INFO("obfs4 handshake: first {} bytes hex: {}", dump_len, hex.str());
+
+                // Detect TLS ClientHello (starts with 0x16 0x03)
+                if (*bytes_read >= 3 && buffer[0] == 0x16 &&
+                    buffer[1] == 0x03) {
+                    LOG_WARN("obfs4 handshake: received TLS ClientHello, not obfs4 data");
+                }
+            }
+
             auto data = std::span<const uint8_t>(buffer.data(), *bytes_read);
             auto consume_result = handshake->consume(data);
             if (!consume_result) {
@@ -184,14 +202,15 @@ void Obfs4Listener::handle_connection(std::shared_ptr<net::TcpConnection> conn) 
                 auto obfs4_read = conn->read(
                     std::span<uint8_t>(buf.data(), buf.size()));
                 if (!obfs4_read || *obfs4_read == 0) {
-                    LOG_DEBUG("obfs4 proxy: client connection closed");
+                    LOG_WARN("obfs4 proxy: client connection closed");
                     break;
                 }
 
                 auto encrypted = std::span<const uint8_t>(buf.data(), *obfs4_read);
                 auto frames = framing->decode(encrypted);
                 if (!frames) {
-                    LOG_WARN("obfs4 proxy: frame decryption failed");
+                    LOG_WARN("obfs4 proxy: frame decryption failed (read {} bytes)",
+                             *obfs4_read);
                     break;
                 }
 
@@ -208,7 +227,7 @@ void Obfs4Listener::handle_connection(std::shared_ptr<net::TcpConnection> conn) 
                                 std::span<const uint8_t>(pkt.payload.data(),
                                                          pkt.payload.size()));
                             if (!wr) {
-                                LOG_DEBUG("obfs4 proxy: OR write failed");
+                                LOG_WARN("obfs4 proxy: OR write failed");
                                 running.store(false, std::memory_order_relaxed);
                                 return;
                             }
@@ -232,7 +251,7 @@ void Obfs4Listener::handle_connection(std::shared_ptr<net::TcpConnection> conn) 
                 auto or_read = or_conn->read(
                     std::span<uint8_t>(buf.data(), buf.size()));
                 if (!or_read || *or_read == 0) {
-                    LOG_DEBUG("obfs4 proxy: OR connection closed");
+                    LOG_WARN("obfs4 proxy: OR connection closed");
                     break;
                 }
 
@@ -258,7 +277,7 @@ void Obfs4Listener::handle_connection(std::shared_ptr<net::TcpConnection> conn) 
                     auto wr = conn->write(
                         std::span<const uint8_t>(frame.data(), frame.size()));
                     if (!wr) {
-                        LOG_DEBUG("obfs4 proxy: client write failed");
+                        LOG_WARN("obfs4 proxy: client write failed");
                         running.store(false, std::memory_order_relaxed);
                         return;
                     }

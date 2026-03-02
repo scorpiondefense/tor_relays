@@ -195,7 +195,6 @@ private:
     VersionsHandler versions_handler_;
     CertsHandler certs_handler_;
     AuthChallengeHandler auth_challenge_handler_;
-    AuthenticateHandler authenticate_handler_;
     NetinfoHandler netinfo_handler_;
 
     LinkState state_{LinkState::Initial};
