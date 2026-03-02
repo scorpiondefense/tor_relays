@@ -39,7 +39,7 @@ enum class TorCertType : uint8_t {
     ED25519_SIGNING = 4,    // Ed25519 signing key
     TLS_LINK = 5,          // TLS link certificate
     ED25519_AUTHENTICATE = 6,  // Ed25519 authentication
-    ED25519_IDENTITY = 7,   // Ed25519 identity
+    RSA_ED25519_CROSS_CERT = 7,  // RSA->Ed25519 cross-certificate
 };
 
 // Certificate structure for CERTS cell

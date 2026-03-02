@@ -8,6 +8,9 @@
 #include <string>
 #include <vector>
 
+// Forward declarations for OpenSSL
+typedef struct evp_pkey_st EVP_PKEY;
+
 namespace tor::crypto {
 
 // Key sizes
@@ -150,10 +153,53 @@ private:
     void clear();
 };
 
+// RSA 1024-bit identity key (legacy, required for Tor link protocol)
+class Rsa1024Identity {
+public:
+    Rsa1024Identity() = default;
+    ~Rsa1024Identity();
+
+    // Disable copying, allow moving
+    Rsa1024Identity(const Rsa1024Identity&) = delete;
+    Rsa1024Identity& operator=(const Rsa1024Identity&) = delete;
+    Rsa1024Identity(Rsa1024Identity&&) noexcept;
+    Rsa1024Identity& operator=(Rsa1024Identity&&) noexcept;
+
+    [[nodiscard]] static std::expected<Rsa1024Identity, KeyError> generate();
+    [[nodiscard]] static std::expected<Rsa1024Identity, KeyError>
+    from_der_private(std::span<const uint8_t> der);
+
+    // DER-encoded keys
+    [[nodiscard]] std::vector<uint8_t> private_key_der() const;
+    [[nodiscard]] std::vector<uint8_t> public_key_der() const;
+
+    // RSA-PKCS1v1.5-SHA256 signature
+    [[nodiscard]] std::expected<std::vector<uint8_t>, KeyError>
+    sign_sha256(std::span<const uint8_t> data) const;
+
+    // Create self-signed X.509 identity cert (Type 2)
+    [[nodiscard]] std::expected<std::vector<uint8_t>, KeyError>
+    create_identity_cert() const;
+
+    // Create X.509 link cert: TLS public key signed by RSA identity (Type 1)
+    [[nodiscard]] std::expected<std::vector<uint8_t>, KeyError>
+    create_link_cert(EVP_PKEY* tls_pkey) const;
+
+    // Create RSA->Ed25519 cross-cert (Type 7)
+    [[nodiscard]] std::expected<std::vector<uint8_t>, KeyError>
+    create_ed25519_cross_cert(const Ed25519PublicKey& ed_pub) const;
+
+    [[nodiscard]] bool is_valid() const { return pkey_ != nullptr; }
+
+private:
+    EVP_PKEY* pkey_{nullptr};
+};
+
 // Key pair combining identity and onion keys
 struct RelayKeyPair {
     Ed25519SecretKey identity_key;
     Curve25519SecretKey onion_key;
+    Rsa1024Identity rsa_identity;
 
     [[nodiscard]] static std::expected<RelayKeyPair, KeyError> generate();
 };
@@ -166,6 +212,7 @@ public:
     NodeId() = default;
     explicit NodeId(std::array<uint8_t, SIZE> data);
     explicit NodeId(const Ed25519PublicKey& identity_key);
+    explicit NodeId(std::span<const uint8_t> rsa_public_key_der);
 
     [[nodiscard]] const std::array<uint8_t, SIZE>& data() const { return data_; }
     [[nodiscard]] std::span<const uint8_t> as_span() const { return data_; }

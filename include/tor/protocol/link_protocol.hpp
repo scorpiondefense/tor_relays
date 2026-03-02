@@ -73,7 +73,9 @@ public:
     create_certs_cell(
         const crypto::Ed25519SecretKey& identity_key,
         const crypto::Ed25519PublicKey& identity_pub,
-        const std::vector<uint8_t>& tls_cert
+        const std::vector<uint8_t>& tls_cert,
+        const crypto::Rsa1024Identity& rsa_identity,
+        EVP_PKEY* tls_evp_pkey
     ) const;
 
     // Parse and validate received CERTS cell
@@ -172,7 +174,9 @@ public:
     handshake_as_responder(
         core::Channel& channel,
         const crypto::Ed25519SecretKey& identity_key,
-        const crypto::Ed25519PublicKey& identity_pub
+        const crypto::Ed25519PublicKey& identity_pub,
+        const crypto::Rsa1024Identity& rsa_identity,
+        EVP_PKEY* tls_evp_pkey
     );
 
     // Get negotiated version

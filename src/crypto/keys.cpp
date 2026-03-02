@@ -3,7 +3,10 @@
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/err.h>
+#include <openssl/x509.h>
+#include <openssl/rsa.h>
 #include <cstring>
+#include <chrono>
 #include <iomanip>
 #include <sstream>
 
@@ -453,6 +456,250 @@ Curve25519SecretKey::diffie_hellman(const Curve25519PublicKey& peer_public) cons
     return shared_secret;
 }
 
+// Rsa1024Identity implementation
+Rsa1024Identity::~Rsa1024Identity() {
+    if (pkey_) {
+        EVP_PKEY_free(pkey_);
+    }
+}
+
+Rsa1024Identity::Rsa1024Identity(Rsa1024Identity&& other) noexcept
+    : pkey_(other.pkey_) {
+    other.pkey_ = nullptr;
+}
+
+Rsa1024Identity& Rsa1024Identity::operator=(Rsa1024Identity&& other) noexcept {
+    if (this != &other) {
+        if (pkey_) {
+            EVP_PKEY_free(pkey_);
+        }
+        pkey_ = other.pkey_;
+        other.pkey_ = nullptr;
+    }
+    return *this;
+}
+
+std::expected<Rsa1024Identity, KeyError> Rsa1024Identity::generate() {
+    Rsa1024Identity key;
+    key.pkey_ = EVP_RSA_gen(1024);
+    if (!key.pkey_) {
+        return std::unexpected(KeyError::GenerationFailed);
+    }
+    return key;
+}
+
+std::expected<Rsa1024Identity, KeyError>
+Rsa1024Identity::from_der_private(std::span<const uint8_t> der) {
+    Rsa1024Identity key;
+    const unsigned char* p = der.data();
+    key.pkey_ = d2i_PrivateKey(EVP_PKEY_RSA, nullptr, &p,
+                                static_cast<long>(der.size()));
+    if (!key.pkey_) {
+        return std::unexpected(KeyError::ParseError);
+    }
+    return key;
+}
+
+std::vector<uint8_t> Rsa1024Identity::private_key_der() const {
+    if (!pkey_) return {};
+    int len = i2d_PrivateKey(pkey_, nullptr);
+    if (len <= 0) return {};
+    std::vector<uint8_t> der(static_cast<size_t>(len));
+    unsigned char* p = der.data();
+    i2d_PrivateKey(pkey_, &p);
+    return der;
+}
+
+std::vector<uint8_t> Rsa1024Identity::public_key_der() const {
+    if (!pkey_) return {};
+    int len = i2d_PUBKEY(pkey_, nullptr);
+    if (len <= 0) return {};
+    std::vector<uint8_t> der(static_cast<size_t>(len));
+    unsigned char* p = der.data();
+    i2d_PUBKEY(pkey_, &p);
+    return der;
+}
+
+std::expected<std::vector<uint8_t>, KeyError>
+Rsa1024Identity::sign_sha256(std::span<const uint8_t> data) const {
+    if (!pkey_) {
+        return std::unexpected(KeyError::InvalidKey);
+    }
+
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (!ctx) {
+        return std::unexpected(KeyError::SigningFailed);
+    }
+
+    if (EVP_DigestSignInit(ctx, nullptr, EVP_sha256(), nullptr, pkey_) != 1) {
+        EVP_MD_CTX_free(ctx);
+        return std::unexpected(KeyError::SigningFailed);
+    }
+
+    if (EVP_DigestSignUpdate(ctx, data.data(), data.size()) != 1) {
+        EVP_MD_CTX_free(ctx);
+        return std::unexpected(KeyError::SigningFailed);
+    }
+
+    size_t sig_len = 0;
+    if (EVP_DigestSignFinal(ctx, nullptr, &sig_len) != 1) {
+        EVP_MD_CTX_free(ctx);
+        return std::unexpected(KeyError::SigningFailed);
+    }
+
+    std::vector<uint8_t> sig(sig_len);
+    if (EVP_DigestSignFinal(ctx, sig.data(), &sig_len) != 1) {
+        EVP_MD_CTX_free(ctx);
+        return std::unexpected(KeyError::SigningFailed);
+    }
+
+    EVP_MD_CTX_free(ctx);
+    sig.resize(sig_len);
+    return sig;
+}
+
+std::expected<std::vector<uint8_t>, KeyError>
+Rsa1024Identity::create_identity_cert() const {
+    if (!pkey_) {
+        return std::unexpected(KeyError::InvalidKey);
+    }
+
+    X509* x509 = X509_new();
+    if (!x509) {
+        return std::unexpected(KeyError::OpenSSLError);
+    }
+
+    ASN1_INTEGER_set(X509_get_serialNumber(x509), 1);
+    X509_gmtime_adj(X509_get_notBefore(x509), 0);
+    X509_gmtime_adj(X509_get_notAfter(x509), 365 * 24 * 60 * 60);
+    X509_set_pubkey(x509, pkey_);
+
+    X509_NAME* name = X509_get_subject_name(x509);
+    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+        reinterpret_cast<const unsigned char*>("Tor relay"), -1, -1, 0);
+    X509_set_issuer_name(x509, name);
+
+    if (X509_sign(x509, pkey_, EVP_sha256()) == 0) {
+        X509_free(x509);
+        return std::unexpected(KeyError::SigningFailed);
+    }
+
+    int der_len = i2d_X509(x509, nullptr);
+    if (der_len <= 0) {
+        X509_free(x509);
+        return std::unexpected(KeyError::OpenSSLError);
+    }
+
+    std::vector<uint8_t> der(static_cast<size_t>(der_len));
+    unsigned char* p = der.data();
+    i2d_X509(x509, &p);
+    X509_free(x509);
+
+    return der;
+}
+
+std::expected<std::vector<uint8_t>, KeyError>
+Rsa1024Identity::create_link_cert(EVP_PKEY* tls_pkey) const {
+    if (!pkey_ || !tls_pkey) {
+        return std::unexpected(KeyError::InvalidKey);
+    }
+
+    X509* x509 = X509_new();
+    if (!x509) {
+        return std::unexpected(KeyError::OpenSSLError);
+    }
+
+    ASN1_INTEGER_set(X509_get_serialNumber(x509), 2);
+    X509_gmtime_adj(X509_get_notBefore(x509), 0);
+    X509_gmtime_adj(X509_get_notAfter(x509), 365 * 24 * 60 * 60);
+
+    // Set the TLS public key as the subject key
+    X509_set_pubkey(x509, tls_pkey);
+
+    X509_NAME* subject = X509_get_subject_name(x509);
+    X509_NAME_add_entry_by_txt(subject, "CN", MBSTRING_ASC,
+        reinterpret_cast<const unsigned char*>("Tor relay"), -1, -1, 0);
+
+    // Issuer is the RSA identity key
+    X509_NAME* issuer = X509_NAME_new();
+    X509_NAME_add_entry_by_txt(issuer, "CN", MBSTRING_ASC,
+        reinterpret_cast<const unsigned char*>("Tor relay"), -1, -1, 0);
+    X509_set_issuer_name(x509, issuer);
+    X509_NAME_free(issuer);
+
+    // Sign with RSA identity key
+    if (X509_sign(x509, pkey_, EVP_sha256()) == 0) {
+        X509_free(x509);
+        return std::unexpected(KeyError::SigningFailed);
+    }
+
+    int der_len = i2d_X509(x509, nullptr);
+    if (der_len <= 0) {
+        X509_free(x509);
+        return std::unexpected(KeyError::OpenSSLError);
+    }
+
+    std::vector<uint8_t> der(static_cast<size_t>(der_len));
+    unsigned char* p = der.data();
+    i2d_X509(x509, &p);
+    X509_free(x509);
+
+    return der;
+}
+
+std::expected<std::vector<uint8_t>, KeyError>
+Rsa1024Identity::create_ed25519_cross_cert(const Ed25519PublicKey& ed_pub) const {
+    if (!pkey_) {
+        return std::unexpected(KeyError::InvalidKey);
+    }
+
+    // Binary format per cert-spec.txt:
+    // ED25519_KEY (32 bytes) || EXPIRATION_DATE (4 bytes, hours since epoch)
+    // || SIGLEN (1 byte) || RSA_SIG (variable, 128 bytes for 1024-bit key)
+    //
+    // Signature covers:
+    // "Tor TLS RSA/Ed25519 cross-certificate" || ED25519_KEY || EXPIRATION
+
+    auto now = std::chrono::system_clock::now();
+    auto secs = std::chrono::duration_cast<std::chrono::seconds>(
+        now.time_since_epoch()).count();
+    uint32_t exp_hours = static_cast<uint32_t>((secs / 3600) + 24);
+
+    // Build the data to sign
+    const std::string prefix = "Tor TLS RSA/Ed25519 cross-certificate";
+    std::vector<uint8_t> to_sign;
+    to_sign.insert(to_sign.end(), prefix.begin(), prefix.end());
+    auto ed_data = ed_pub.as_span();
+    to_sign.insert(to_sign.end(), ed_data.begin(), ed_data.end());
+    // Expiration in network byte order (big-endian)
+    to_sign.push_back(static_cast<uint8_t>((exp_hours >> 24) & 0xFF));
+    to_sign.push_back(static_cast<uint8_t>((exp_hours >> 16) & 0xFF));
+    to_sign.push_back(static_cast<uint8_t>((exp_hours >> 8) & 0xFF));
+    to_sign.push_back(static_cast<uint8_t>(exp_hours & 0xFF));
+
+    // RSA-PKCS1v1.5-SHA256 signature
+    auto sig = sign_sha256(to_sign);
+    if (!sig) {
+        return std::unexpected(sig.error());
+    }
+
+    // Build the cross-cert
+    std::vector<uint8_t> cert;
+    // ED25519_KEY (32 bytes)
+    cert.insert(cert.end(), ed_data.begin(), ed_data.end());
+    // EXPIRATION_DATE (4 bytes, big-endian)
+    cert.push_back(static_cast<uint8_t>((exp_hours >> 24) & 0xFF));
+    cert.push_back(static_cast<uint8_t>((exp_hours >> 16) & 0xFF));
+    cert.push_back(static_cast<uint8_t>((exp_hours >> 8) & 0xFF));
+    cert.push_back(static_cast<uint8_t>(exp_hours & 0xFF));
+    // SIGLEN (1 byte)
+    cert.push_back(static_cast<uint8_t>(sig->size()));
+    // RSA_SIG
+    cert.insert(cert.end(), sig->begin(), sig->end());
+
+    return cert;
+}
+
 // RelayKeyPair implementation
 std::expected<RelayKeyPair, KeyError> RelayKeyPair::generate() {
     auto identity = Ed25519SecretKey::generate();
@@ -465,7 +712,12 @@ std::expected<RelayKeyPair, KeyError> RelayKeyPair::generate() {
         return std::unexpected(onion.error());
     }
 
-    return RelayKeyPair{std::move(*identity), std::move(*onion)};
+    auto rsa = Rsa1024Identity::generate();
+    if (!rsa) {
+        return std::unexpected(rsa.error());
+    }
+
+    return RelayKeyPair{std::move(*identity), std::move(*onion), std::move(*rsa)};
 }
 
 // NodeId implementation
@@ -473,6 +725,13 @@ NodeId::NodeId(std::array<uint8_t, SIZE> data) : data_(data) {}
 
 NodeId::NodeId(const Ed25519PublicKey& identity_key) {
     auto hash = sha1(identity_key.as_span());
+    if (hash) {
+        data_ = *hash;
+    }
+}
+
+NodeId::NodeId(std::span<const uint8_t> rsa_public_key_der) {
+    auto hash = sha1(rsa_public_key_der);
     if (hash) {
         data_ = *hash;
     }
