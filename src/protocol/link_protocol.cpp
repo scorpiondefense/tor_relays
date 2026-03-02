@@ -4,10 +4,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
-#include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
-#include <openssl/x509.h>
 
 namespace tor::protocol {
 
@@ -162,27 +160,6 @@ CertsHandler::create_certs_cell(
         LOG_WARN("OR CERTS: failed to create RSA identity cert");
         return std::unexpected(LinkProtocolError::CertificateError);
     }
-    LOG_INFO("OR CERTS: Type 2 RSA identity cert: {} bytes", cert2->size());
-
-    // Debug: verify the cert round-trips correctly
-    {
-        const unsigned char* p = cert2->data();
-        X509* x509_check = d2i_X509(nullptr, &p, static_cast<long>(cert2->size()));
-        if (x509_check) {
-            EVP_PKEY* pk = X509_get0_pubkey(x509_check);
-            if (pk) {
-                int key_type = EVP_PKEY_base_id(pk);
-                int key_bits = EVP_PKEY_bits(pk);
-                LOG_INFO("OR CERTS: Type 2 cert key: type={} bits={} (expect type=6[RSA] bits=1024)",
-                         key_type, key_bits);
-            } else {
-                LOG_WARN("OR CERTS: Type 2 cert has NULL public key!");
-            }
-            X509_free(x509_check);
-        } else {
-            LOG_WARN("OR CERTS: Type 2 cert failed DER parse!");
-        }
-    }
 
     // Type 4: Ed25519 signing key, certified by identity key
     auto cert4 = build_ed25519_cert(
@@ -227,23 +204,7 @@ CertsHandler::create_certs_cell(
     payload.write_u16(static_cast<uint16_t>(cert7->size()));
     payload.write_bytes(*cert7);
 
-    auto payload_data = payload.take();
-    LOG_INFO("OR CERTS: total payload {} bytes: N={} cert2={} cert4={} cert5={} cert7={}",
-             payload_data.size(), 4, cert2->size(), cert4.size(), cert5.size(), cert7->size());
-
-    // Dump first 20 hex bytes of the payload for debugging
-    {
-        std::string hex;
-        for (size_t i = 0; i < std::min(payload_data.size(), size_t(40)); ++i) {
-            char buf[4];
-            snprintf(buf, sizeof(buf), "%02x", payload_data[i]);
-            hex += buf;
-            if (i < 39) hex += " ";
-        }
-        LOG_INFO("OR CERTS: payload hex: {}", hex);
-    }
-
-    return core::VariableCell(0, core::CellCommand::CERTS, std::move(payload_data));
+    return core::VariableCell(0, core::CellCommand::CERTS, payload.take());
 }
 
 std::expected<std::vector<crypto::TorCertificate>, LinkProtocolError>

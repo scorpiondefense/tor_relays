@@ -5,6 +5,7 @@
 #include <openssl/err.h>
 #include <openssl/x509.h>
 #include <openssl/rsa.h>
+#include <openssl/sha.h>
 #include <cstring>
 #include <chrono>
 #include <iomanip>
@@ -648,6 +649,50 @@ Rsa1024Identity::create_link_cert(EVP_PKEY* tls_pkey) const {
 }
 
 std::expected<std::vector<uint8_t>, KeyError>
+Rsa1024Identity::sign_raw(std::span<const uint8_t> data) const {
+    if (!pkey_) {
+        return std::unexpected(KeyError::InvalidKey);
+    }
+
+    // Raw RSA signing with PKCS1 padding (no digest wrapping).
+    // Equivalent to Tor's crypto_pk_private_sign which calls
+    // RSA_private_encrypt(data, RSA_PKCS1_PADDING).
+    EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new(pkey_, nullptr);
+    if (!ctx) {
+        return std::unexpected(KeyError::SigningFailed);
+    }
+
+    if (EVP_PKEY_sign_init(ctx) <= 0) {
+        EVP_PKEY_CTX_free(ctx);
+        return std::unexpected(KeyError::SigningFailed);
+    }
+
+    if (EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_PADDING) <= 0) {
+        EVP_PKEY_CTX_free(ctx);
+        return std::unexpected(KeyError::SigningFailed);
+    }
+
+    // No digest set — signs the raw data directly
+
+    // Get required signature length
+    size_t sig_len = 0;
+    if (EVP_PKEY_sign(ctx, nullptr, &sig_len, data.data(), data.size()) <= 0) {
+        EVP_PKEY_CTX_free(ctx);
+        return std::unexpected(KeyError::SigningFailed);
+    }
+
+    std::vector<uint8_t> sig(sig_len);
+    if (EVP_PKEY_sign(ctx, sig.data(), &sig_len, data.data(), data.size()) <= 0) {
+        EVP_PKEY_CTX_free(ctx);
+        return std::unexpected(KeyError::SigningFailed);
+    }
+
+    EVP_PKEY_CTX_free(ctx);
+    sig.resize(sig_len);
+    return sig;
+}
+
+std::expected<std::vector<uint8_t>, KeyError>
 Rsa1024Identity::create_ed25519_cross_cert(const Ed25519PublicKey& ed_pub) const {
     if (!pkey_) {
         return std::unexpected(KeyError::InvalidKey);
@@ -657,28 +702,33 @@ Rsa1024Identity::create_ed25519_cross_cert(const Ed25519PublicKey& ed_pub) const
     // ED25519_KEY (32 bytes) || EXPIRATION_DATE (4 bytes, hours since epoch)
     // || SIGLEN (1 byte) || RSA_SIG (variable, 128 bytes for 1024-bit key)
     //
-    // Signature covers:
-    // "Tor TLS RSA/Ed25519 cross-certificate" || ED25519_KEY || EXPIRATION
+    // Tor signs SHA256(prefix || ED25519_KEY || EXPIRATION) with raw RSA
+    // (RSA_private_encrypt of the 32-byte hash, NOT RSA-SHA256 DigestInfo).
 
     auto now = std::chrono::system_clock::now();
     auto secs = std::chrono::duration_cast<std::chrono::seconds>(
         now.time_since_epoch()).count();
     uint32_t exp_hours = static_cast<uint32_t>((secs / 3600) + 24);
 
-    // Build the data to sign
+    // Build the data to hash
     const std::string prefix = "Tor TLS RSA/Ed25519 cross-certificate";
-    std::vector<uint8_t> to_sign;
-    to_sign.insert(to_sign.end(), prefix.begin(), prefix.end());
+    std::vector<uint8_t> to_hash;
+    to_hash.insert(to_hash.end(), prefix.begin(), prefix.end());
     auto ed_data = ed_pub.as_span();
-    to_sign.insert(to_sign.end(), ed_data.begin(), ed_data.end());
+    to_hash.insert(to_hash.end(), ed_data.begin(), ed_data.end());
     // Expiration in network byte order (big-endian)
-    to_sign.push_back(static_cast<uint8_t>((exp_hours >> 24) & 0xFF));
-    to_sign.push_back(static_cast<uint8_t>((exp_hours >> 16) & 0xFF));
-    to_sign.push_back(static_cast<uint8_t>((exp_hours >> 8) & 0xFF));
-    to_sign.push_back(static_cast<uint8_t>(exp_hours & 0xFF));
+    to_hash.push_back(static_cast<uint8_t>((exp_hours >> 24) & 0xFF));
+    to_hash.push_back(static_cast<uint8_t>((exp_hours >> 16) & 0xFF));
+    to_hash.push_back(static_cast<uint8_t>((exp_hours >> 8) & 0xFF));
+    to_hash.push_back(static_cast<uint8_t>(exp_hours & 0xFF));
 
-    // RSA-PKCS1v1.5-SHA256 signature
-    auto sig = sign_sha256(to_sign);
+    // Compute SHA256 digest
+    std::array<uint8_t, 32> digest;
+    SHA256(to_hash.data(), to_hash.size(), digest.data());
+
+    // Raw RSA signature of the 32-byte SHA256 hash
+    // (matches Tor's crypto_pk_private_sign which uses RSA_private_encrypt)
+    auto sig = sign_raw(digest);
     if (!sig) {
         return std::unexpected(sig.error());
     }

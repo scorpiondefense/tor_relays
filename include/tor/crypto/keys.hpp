@@ -177,6 +177,11 @@ public:
     [[nodiscard]] std::expected<std::vector<uint8_t>, KeyError>
     sign_sha256(std::span<const uint8_t> data) const;
 
+    // Raw RSA signature (PKCS1 padding, no digest wrapping)
+    // Equivalent to Tor's crypto_pk_private_sign / RSA_private_encrypt
+    [[nodiscard]] std::expected<std::vector<uint8_t>, KeyError>
+    sign_raw(std::span<const uint8_t> data) const;
+
     // Create self-signed X.509 identity cert (Type 2)
     [[nodiscard]] std::expected<std::vector<uint8_t>, KeyError>
     create_identity_cert() const;
