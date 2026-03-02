@@ -74,8 +74,7 @@ public:
         const crypto::Ed25519SecretKey& identity_key,
         const crypto::Ed25519PublicKey& identity_pub,
         const std::vector<uint8_t>& tls_cert,
-        const crypto::Rsa1024Identity& rsa_identity,
-        EVP_PKEY* tls_evp_pkey
+        const crypto::Rsa1024Identity& rsa_identity
     ) const;
 
     // Parse and validate received CERTS cell
@@ -175,8 +174,7 @@ public:
         core::Channel& channel,
         const crypto::Ed25519SecretKey& identity_key,
         const crypto::Ed25519PublicKey& identity_pub,
-        const crypto::Rsa1024Identity& rsa_identity,
-        EVP_PKEY* tls_evp_pkey
+        const crypto::Rsa1024Identity& rsa_identity
     );
 
     // Get negotiated version

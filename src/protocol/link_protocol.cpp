@@ -60,11 +60,13 @@ VersionsHandler::negotiate_version(std::span<const uint16_t> peer_versions) cons
 // --- CertsHandler ---
 
 // Helper: Build a Tor Ed25519 certificate
+// cert_key_type: 0x01 = Ed25519 key, 0x03 = SHA-256 hash of X.509 cert
 static std::vector<uint8_t> build_ed25519_cert(
     uint8_t cert_type,
     const crypto::Ed25519PublicKey& certified_key,
     const crypto::Ed25519SecretKey& signing_key,
-    const crypto::Ed25519PublicKey* signer_key_for_ext = nullptr)
+    const crypto::Ed25519PublicKey* signer_key_for_ext = nullptr,
+    uint8_t cert_key_type = 0x01)
 {
     BinaryWriter writer;
 
@@ -81,8 +83,8 @@ static std::vector<uint8_t> build_ed25519_cert(
     uint32_t exp_hours = static_cast<uint32_t>((secs / 3600) + 24);
     writer.write_u32(exp_hours);
 
-    // CERT_KEY_TYPE = 1 (Ed25519)
-    writer.write_u8(1);
+    // CERT_KEY_TYPE (0x01=Ed25519, 0x03=SHA256-of-X509)
+    writer.write_u8(cert_key_type);
 
     // CERTIFIED_KEY
     writer.write_bytes(certified_key.as_span());
@@ -132,7 +134,8 @@ static std::vector<uint8_t> build_tls_link_cert(
         static_cast<uint8_t>(crypto::TorCertType::TLS_LINK),
         cert_key,
         signing_key,
-        &signer_pub);
+        &signer_pub,
+        0x03);  // CERT_KEY_TYPE = SHA-256 hash of X.509 certificate
 }
 
 std::expected<core::VariableCell, LinkProtocolError>
@@ -140,8 +143,7 @@ CertsHandler::create_certs_cell(
     const crypto::Ed25519SecretKey& identity_key,
     const crypto::Ed25519PublicKey& identity_pub,
     const std::vector<uint8_t>& tls_cert_der,
-    const crypto::Rsa1024Identity& rsa_identity,
-    EVP_PKEY* tls_evp_pkey
+    const crypto::Rsa1024Identity& rsa_identity
 ) const {
     // Generate an ephemeral Ed25519 signing key
     auto signing_key_result = crypto::Ed25519SecretKey::generate();
@@ -151,12 +153,6 @@ CertsHandler::create_certs_cell(
 
     auto& signing_key = *signing_key_result;
     auto signing_pub = signing_key.public_key();
-
-    // Type 1: Link cert (X.509, TLS key signed by RSA identity)
-    auto cert1 = rsa_identity.create_link_cert(tls_evp_pkey);
-    if (!cert1) {
-        return std::unexpected(LinkProtocolError::CertificateError);
-    }
 
     // Type 2: RSA identity cert (self-signed X.509)
     auto cert2 = rsa_identity.create_identity_cert();
@@ -171,7 +167,7 @@ CertsHandler::create_certs_cell(
         identity_key,
         &identity_pub);
 
-    // Type 5: TLS link cert, certified by signing key
+    // Type 5: TLS link cert (SHA256 of X.509 TLS cert), certified by signing key
     auto cert5 = build_tls_link_cert(tls_cert_der, signing_key, signing_pub);
 
     // Type 7: RSA->Ed25519 cross-cert
@@ -181,27 +177,23 @@ CertsHandler::create_certs_cell(
     }
 
     // Build CERTS cell payload
+    // Ed25519 auth path: Types 2, 4, 5, 7 (NOT Type 1 which is RSA-only legacy)
     BinaryWriter payload;
 
-    // N_CERTS = 5
-    payload.write_u8(5);
-
-    // Cert Type 1: Link Key Certificate (X.509, DER)
-    payload.write_u8(static_cast<uint8_t>(crypto::TorCertType::LINK_KEY));
-    payload.write_u16(static_cast<uint16_t>(cert1->size()));
-    payload.write_bytes(*cert1);
+    // N_CERTS = 4
+    payload.write_u8(4);
 
     // Cert Type 2: RSA Identity Certificate (X.509, DER)
     payload.write_u8(static_cast<uint8_t>(crypto::TorCertType::RSA_IDENTITY));
     payload.write_u16(static_cast<uint16_t>(cert2->size()));
     payload.write_bytes(*cert2);
 
-    // Cert Type 4: Ed25519 Signing Key
+    // Cert Type 4: Ed25519 Signing Key (identity -> signing)
     payload.write_u8(static_cast<uint8_t>(crypto::TorCertType::ED25519_SIGNING));
     payload.write_u16(static_cast<uint16_t>(cert4.size()));
     payload.write_bytes(cert4);
 
-    // Cert Type 5: TLS Link Cert (Ed25519)
+    // Cert Type 5: TLS Link Cert (signing -> SHA256(TLS cert))
     payload.write_u8(static_cast<uint8_t>(crypto::TorCertType::TLS_LINK));
     payload.write_u16(static_cast<uint16_t>(cert5.size()));
     payload.write_bytes(cert5);
@@ -408,8 +400,7 @@ LinkProtocolHandler::handshake_as_responder(
     core::Channel& channel,
     const crypto::Ed25519SecretKey& identity_key,
     const crypto::Ed25519PublicKey& identity_pub,
-    const crypto::Rsa1024Identity& rsa_identity,
-    EVP_PKEY* tls_evp_pkey
+    const crypto::Rsa1024Identity& rsa_identity
 ) {
     // Step 1: Receive VERSIONS from client
     LOG_INFO("OR: waiting for VERSIONS cell");
@@ -457,7 +448,7 @@ LinkProtocolHandler::handshake_as_responder(
     auto tls_cert_der = channel.tls_cert_der();
     auto certs_cell = certs_handler_.create_certs_cell(
         identity_key, identity_pub, tls_cert_der,
-        rsa_identity, tls_evp_pkey);
+        rsa_identity);
     if (!certs_cell) {
         LOG_WARN("OR: failed to create CERTS cell");
         state_ = LinkState::Failed;

@@ -10,7 +10,6 @@
 #include <openssl/x509.h>
 #include <openssl/pem.h>
 #include <openssl/bio.h>
-#include <openssl/evp.h>
 #include <thread>
 
 namespace tor::core {
@@ -21,16 +20,9 @@ struct Relay::Impl {
     boost::asio::io_context io_context;
     crypto::TlsContext tls_ctx;
     std::vector<uint8_t> tls_cert_der;
-    EVP_PKEY* tls_evp_pkey{nullptr};
     std::unique_ptr<net::TlsAcceptor> or_acceptor;
     std::unique_ptr<transport::Obfs4Listener> obfs4_listener;
     std::jthread io_thread;
-
-    ~Impl() {
-        if (tls_evp_pkey) {
-            EVP_PKEY_free(tls_evp_pkey);
-        }
-    }
 };
 
 // --- Relay ---
@@ -127,18 +119,6 @@ std::expected<void, RelayError> Relay::start() {
         }
     }
 
-    // Extract TLS EVP_PKEY from PEM for CERTS cell (Type 1 link cert)
-    {
-        BIO* bio = BIO_new_mem_buf(key_pem.data(), static_cast<int>(key_pem.size()));
-        impl_->tls_evp_pkey = PEM_read_bio_PrivateKey(bio, nullptr, nullptr, nullptr);
-        BIO_free(bio);
-
-        if (!impl_->tls_evp_pkey) {
-            LOG_ERROR("Failed to parse TLS private key for CERTS cell");
-            return std::unexpected(RelayError::TlsInitFailed);
-        }
-    }
-
     // Initialize TLS context with the generated certificate
     auto tls_init = impl_->tls_ctx.init_server(cert_pem, key_pem);
     if (!tls_init) {
@@ -162,11 +142,10 @@ std::expected<void, RelayError> Relay::start() {
     // Start TLS accept loop with real connection handler
     auto keys_ptr = keys_.get();
     auto tls_cert_der_ref = &impl_->tls_cert_der;
-    auto tls_evp_pkey = impl_->tls_evp_pkey;
     auto channel_mgr = channel_manager_;
 
     impl_->or_acceptor->start_accept_loop(
-        [keys_ptr, tls_cert_der_ref, tls_evp_pkey, channel_mgr](auto result) {
+        [keys_ptr, tls_cert_der_ref, channel_mgr](auto result) {
         if (!result) {
             LOG_WARN("OR: TLS accept/handshake failed");
             return;
@@ -182,7 +161,7 @@ std::expected<void, RelayError> Relay::start() {
         channel->set_tls_cert_der(*tls_cert_der_ref);
 
         // Run link handshake + cell loop in a dedicated thread
-        std::thread([channel, keys_ptr, tls_evp_pkey, channel_mgr]() {
+        std::thread([channel, keys_ptr, channel_mgr]() {
             LOG_INFO("OR: starting link protocol handshake");
 
             protocol::LinkProtocolHandler handler;
@@ -190,8 +169,7 @@ std::expected<void, RelayError> Relay::start() {
                 *channel,
                 keys_ptr->identity_key,
                 keys_ptr->identity_key.public_key(),
-                keys_ptr->rsa_identity,
-                tls_evp_pkey);
+                keys_ptr->rsa_identity);
 
             if (!hs_result) {
                 LOG_WARN("OR: link handshake failed: {}",
