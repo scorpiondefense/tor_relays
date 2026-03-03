@@ -210,6 +210,11 @@ struct RelayKeyPair {
     Curve25519SecretKey onion_key;
     Rsa1024Identity rsa_identity;
 
+    // Ed25519 key derived from the same seed as onion_key, used for
+    // ntor-onion-key-crosscert in descriptors.
+    Ed25519SecretKey onion_ed_key;
+    uint8_t onion_ed_sign_bit = 0;
+
     [[nodiscard]] static std::expected<RelayKeyPair, KeyError> generate();
 };
 

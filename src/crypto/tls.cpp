@@ -1,9 +1,12 @@
 #include "tor/crypto/tls.hpp"
+#include "tor/util/logging.hpp"
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/x509.h>
 #include <openssl/pem.h>
 #include <cstring>
+#include <cerrno>
+#include <sys/select.h>
 
 namespace tor::crypto {
 
@@ -253,15 +256,37 @@ std::expected<void, TlsError> TlsConnection::handshake() {
         return std::unexpected(TlsError::HandshakeFailed);
     }
 
-    int result = SSL_do_handshake(static_cast<SSL*>(ssl_));
-    if (result == 1) {
-        handshake_complete_ = true;
-        return {};
-    }
+    // Retry handshake on WANT_READ/WANT_WRITE (non-blocking socket support)
+    for (int attempts = 0; attempts < 100; ++attempts) {
+        int result = SSL_do_handshake(static_cast<SSL*>(ssl_));
+        if (result == 1) {
+            handshake_complete_ = true;
+            return {};
+        }
 
-    int err = SSL_get_error(static_cast<SSL*>(ssl_), result);
-    if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
-        return std::unexpected(TlsError::WouldBlock);
+        int err = SSL_get_error(static_cast<SSL*>(ssl_), result);
+        if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+            // Wait for socket to be ready using select()
+            int fd = SSL_get_fd(static_cast<SSL*>(ssl_));
+            fd_set fds;
+            FD_ZERO(&fds);
+            FD_SET(fd, &fds);
+            struct timeval tv = {10, 0}; // 10 second timeout
+
+            int sel_result;
+            if (err == SSL_ERROR_WANT_READ) {
+                sel_result = select(fd + 1, &fds, nullptr, nullptr, &tv);
+            } else {
+                sel_result = select(fd + 1, nullptr, &fds, nullptr, &tv);
+            }
+
+            if (sel_result <= 0) {
+                return std::unexpected(TlsError::HandshakeFailed);
+            }
+            continue;
+        }
+
+        return std::unexpected(TlsError::HandshakeFailed);
     }
 
     return std::unexpected(TlsError::HandshakeFailed);
@@ -290,18 +315,68 @@ std::expected<size_t, TlsError> TlsConnection::read(std::span<uint8_t> buffer) {
         return std::unexpected(TlsError::ReadFailed);
     }
 
-    int result = SSL_read(static_cast<SSL*>(ssl_), buffer.data(),
-                          static_cast<int>(buffer.size()));
-    if (result > 0) {
-        return static_cast<size_t>(result);
-    }
+    // Clear any stale errors before SSL_read
+    ERR_clear_error();
 
-    int err = SSL_get_error(static_cast<SSL*>(ssl_), result);
-    if (err == SSL_ERROR_ZERO_RETURN) {
-        return std::unexpected(TlsError::ConnectionClosed);
-    }
-    if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
-        return std::unexpected(TlsError::WouldBlock);
+    for (int attempts = 0; attempts < 100; ++attempts) {
+        // Check SSL_pending first
+        int pending = SSL_pending(static_cast<SSL*>(ssl_));
+        if (pending > 0) {
+            LOG_DEBUG("TLS read: {} bytes pending in SSL buffer", pending);
+        }
+
+        int result = SSL_read(static_cast<SSL*>(ssl_), buffer.data(),
+                              static_cast<int>(buffer.size()));
+        if (result > 0) {
+            return static_cast<size_t>(result);
+        }
+
+        int err = SSL_get_error(static_cast<SSL*>(ssl_), result);
+        int saved_errno = errno;
+        LOG_DEBUG("TLS read: SSL_read returned {}, SSL_error={}, errno={} ({}), attempt={}",
+                  result, err, saved_errno, strerror(saved_errno), attempts);
+
+        if (err == SSL_ERROR_ZERO_RETURN) {
+            LOG_DEBUG("TLS read: peer sent close_notify");
+            return std::unexpected(TlsError::ConnectionClosed);
+        }
+        if (err == SSL_ERROR_SYSCALL) {
+            unsigned long ossl_err = ERR_peek_error();
+            LOG_DEBUG("TLS read: SSL_ERROR_SYSCALL, errno={}, openssl_err={}",
+                      saved_errno, ossl_err);
+            if (result == 0) {
+                LOG_DEBUG("TLS read: unexpected EOF (peer closed without close_notify)");
+                return std::unexpected(TlsError::ConnectionClosed);
+            }
+            return std::unexpected(TlsError::ReadFailed);
+        }
+        if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+            int fd = SSL_get_fd(static_cast<SSL*>(ssl_));
+            fd_set fds;
+            FD_ZERO(&fds);
+            FD_SET(fd, &fds);
+            struct timeval tv = {300, 0}; // 5 minute timeout for reads
+            int sel_result;
+            if (err == SSL_ERROR_WANT_READ) {
+                sel_result = select(fd + 1, &fds, nullptr, nullptr, &tv);
+            } else {
+                sel_result = select(fd + 1, nullptr, &fds, nullptr, &tv);
+            }
+            if (sel_result <= 0) {
+                LOG_DEBUG("TLS read: select returned {} (timeout or error)", sel_result);
+                return std::unexpected(TlsError::ReadFailed);
+            }
+            continue;
+        }
+
+        if (err == SSL_ERROR_SSL) {
+            unsigned long ossl_err = ERR_get_error();
+            char err_buf[256];
+            ERR_error_string_n(ossl_err, err_buf, sizeof(err_buf));
+            LOG_DEBUG("TLS read: SSL_ERROR_SSL: {}", err_buf);
+        }
+
+        return std::unexpected(TlsError::ReadFailed);
     }
 
     return std::unexpected(TlsError::ReadFailed);
@@ -312,15 +387,33 @@ std::expected<size_t, TlsError> TlsConnection::write(std::span<const uint8_t> da
         return std::unexpected(TlsError::WriteFailed);
     }
 
-    int result = SSL_write(static_cast<SSL*>(ssl_), data.data(),
-                           static_cast<int>(data.size()));
-    if (result > 0) {
-        return static_cast<size_t>(result);
-    }
+    for (int attempts = 0; attempts < 100; ++attempts) {
+        int result = SSL_write(static_cast<SSL*>(ssl_), data.data(),
+                               static_cast<int>(data.size()));
+        if (result > 0) {
+            return static_cast<size_t>(result);
+        }
 
-    int err = SSL_get_error(static_cast<SSL*>(ssl_), result);
-    if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
-        return std::unexpected(TlsError::WouldBlock);
+        int err = SSL_get_error(static_cast<SSL*>(ssl_), result);
+        if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+            int fd = SSL_get_fd(static_cast<SSL*>(ssl_));
+            fd_set fds;
+            FD_ZERO(&fds);
+            FD_SET(fd, &fds);
+            struct timeval tv = {10, 0}; // 10 second timeout for writes
+            int sel_result;
+            if (err == SSL_ERROR_WANT_READ) {
+                sel_result = select(fd + 1, &fds, nullptr, nullptr, &tv);
+            } else {
+                sel_result = select(fd + 1, nullptr, &fds, nullptr, &tv);
+            }
+            if (sel_result <= 0) {
+                return std::unexpected(TlsError::WriteFailed);
+            }
+            continue;
+        }
+
+        return std::unexpected(TlsError::WriteFailed);
     }
 
     return std::unexpected(TlsError::WriteFailed);

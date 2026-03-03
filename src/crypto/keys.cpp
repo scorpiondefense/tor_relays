@@ -780,17 +780,45 @@ std::expected<RelayKeyPair, KeyError> RelayKeyPair::generate() {
         return std::unexpected(identity.error());
     }
 
-    auto onion = Curve25519SecretKey::generate();
+    // Generate onion key: create Ed25519 key first, then derive Curve25519
+    // from the same seed so both share the same underlying scalar.
+    // This allows ntor-onion-key-crosscert signing.
+    auto onion_ed = Ed25519SecretKey::generate();
+    if (!onion_ed) {
+        return std::unexpected(onion_ed.error());
+    }
+
+    // Derive X25519 scalar from Ed25519 seed: SHA-512(seed)[0:32] clamped
+    auto ed_seed = onion_ed->seed();
+    uint8_t hash[64];
+    SHA512(ed_seed.data(), ed_seed.size(), hash);
+    hash[0] &= 248;
+    hash[31] &= 127;
+    hash[31] |= 64;
+
+    // Create Curve25519 key from the derived scalar
+    auto onion = Curve25519SecretKey::from_bytes(
+        std::span<const uint8_t>(hash, 32));
     if (!onion) {
         return std::unexpected(onion.error());
     }
+
+    // Sign bit = high bit of Ed25519 public key
+    auto ed_pub = onion_ed->public_key().as_span();
+    uint8_t sign_bit = ed_pub[31] >> 7;
 
     auto rsa = Rsa1024Identity::generate();
     if (!rsa) {
         return std::unexpected(rsa.error());
     }
 
-    return RelayKeyPair{std::move(*identity), std::move(*onion), std::move(*rsa)};
+    RelayKeyPair kp;
+    kp.identity_key = std::move(*identity);
+    kp.onion_key = std::move(*onion);
+    kp.rsa_identity = std::move(*rsa);
+    kp.onion_ed_key = std::move(*onion_ed);
+    kp.onion_ed_sign_bit = sign_bit;
+    return kp;
 }
 
 // NodeId implementation

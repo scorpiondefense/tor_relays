@@ -1,4 +1,5 @@
 #include "tor/crypto/key_store.hpp"
+#include <openssl/sha.h>
 #include <fstream>
 
 namespace tor::crypto {
@@ -129,7 +130,34 @@ std::expected<RelayKeyPair, KeyStoreError> KeyStore::load_keys() {
         }
     }
 
-    return RelayKeyPair{std::move(*identity), std::move(*onion), std::move(rsa)};
+    // Generate linked Ed25519/Curve25519 onion key pair for crosscerts.
+    // The loaded Curve25519 key is overridden because we need the Ed25519
+    // counterpart for ntor-onion-key-crosscert signing.
+    auto onion_ed = Ed25519SecretKey::generate();
+    if (!onion_ed) {
+        return std::unexpected(KeyStoreError::KeyGenerationFailed);
+    }
+    auto ed_seed2 = onion_ed->seed();
+    uint8_t hash2[64];
+    SHA512(ed_seed2.data(), ed_seed2.size(), hash2);
+    hash2[0] &= 248;
+    hash2[31] &= 127;
+    hash2[31] |= 64;
+    auto onion_linked = Curve25519SecretKey::from_bytes(
+        std::span<const uint8_t>(hash2, 32));
+    if (!onion_linked) {
+        return std::unexpected(KeyStoreError::InvalidKeyData);
+    }
+    auto ed_pub2 = onion_ed->public_key().as_span();
+    uint8_t sign_bit2 = ed_pub2[31] >> 7;
+
+    RelayKeyPair kp;
+    kp.identity_key = std::move(*identity);
+    kp.onion_key = std::move(*onion_linked);
+    kp.rsa_identity = std::move(rsa);
+    kp.onion_ed_key = std::move(*onion_ed);
+    kp.onion_ed_sign_bit = sign_bit2;
+    return kp;
 }
 
 std::expected<void, KeyStoreError> KeyStore::save_keys(const RelayKeyPair& keys) {
