@@ -17,19 +17,37 @@ std::array<uint8_t, 32> hmac_sha256(
     return *result;
 }
 
+// HKDF-Expand only (RFC 5869 section 2.3)
+// PRK is used as the HMAC key, info is the context
+// T(0) = empty
+// T(i) = HMAC-SHA256(PRK, T(i-1) | info | i)
+// OKM = T(1) | T(2) | ... truncated to length bytes
 std::vector<uint8_t> hkdf_expand(
     std::span<const uint8_t> prk,
     std::span<const uint8_t> info,
     size_t length
 ) {
-    auto result = hkdf_sha256(prk, info, length);
-    if (!result) {
-        throw std::runtime_error("HKDF expand failed");
+    std::vector<uint8_t> output;
+    output.reserve(length);
+    std::array<uint8_t, 32> prev{};
+    bool first = true;
+
+    for (uint8_t i = 1; output.size() < length; ++i) {
+        std::vector<uint8_t> msg;
+        if (!first) {
+            msg.insert(msg.end(), prev.begin(), prev.end());
+        }
+        msg.insert(msg.end(), info.begin(), info.end());
+        msg.push_back(i);
+        prev = hmac_sha256(prk, msg);
+        output.insert(output.end(), prev.begin(), prev.end());
+        first = false;
     }
-    return *result;
+    output.resize(length);
+    return output;
 }
 
-std::array<uint8_t, 32> compute_secret_input(
+std::vector<uint8_t> compute_secret_input(
     const std::array<uint8_t, 32>& exp_xy,
     const std::array<uint8_t, 32>& exp_xb,
     const NodeId& node_id,
@@ -38,6 +56,7 @@ std::array<uint8_t, 32> compute_secret_input(
     const Curve25519PublicKey& server_ephemeral
 ) {
     // secret_input = EXP(X,y) | EXP(X,b) | ID | B | X | Y | PROTOID
+    // Returns the raw concatenation (not hashed)
     std::vector<uint8_t> input;
     input.reserve(32 + 32 + 20 + 32 + 32 + 32 + NTOR_PROTO_ID.size());
 
@@ -49,7 +68,7 @@ std::array<uint8_t, 32> compute_secret_input(
     input.insert(input.end(), server_ephemeral.data().begin(), server_ephemeral.data().end());
     input.insert(input.end(), NTOR_PROTO_ID.begin(), NTOR_PROTO_ID.end());
 
-    return hmac_sha256(NTOR_EXPAND_STR, input);
+    return input;
 }
 
 std::array<uint8_t, 32> compute_auth(
@@ -126,7 +145,7 @@ NtorClientHandshake::complete_handshake(std::span<const uint8_t> server_response
         return std::unexpected(NtorError::LowOrderPoint);
     }
 
-    // Compute shared secrets
+    // Compute shared secrets: client uses (Y^x, B^x)
     auto exp_xy = ephemeral_key_.diffie_hellman(server_ephemeral);
     if (!exp_xy) {
         return std::unexpected(NtorError::KeyDerivationFailed);
@@ -137,15 +156,15 @@ NtorClientHandshake::complete_handshake(std::span<const uint8_t> server_response
         return std::unexpected(NtorError::KeyDerivationFailed);
     }
 
-    // Compute secret_input
+    // Compute raw secret_input
     auto secret_input = ntor_detail::compute_secret_input(
         *exp_xy, *exp_xb, server_node_id_, server_onion_key_,
         ephemeral_key_.public_key(), server_ephemeral);
 
-    // Derive verify
+    // verify = H(secret_input, t_verify)
     auto verify = ntor_detail::hmac_sha256(NTOR_VERIFY_STR, secret_input);
 
-    // Compute expected auth
+    // Compute expected auth = H(auth_input, t_mac)
     auto expected_auth = ntor_detail::compute_auth(
         verify, server_node_id_, server_onion_key_,
         server_ephemeral, ephemeral_key_.public_key());
@@ -155,24 +174,28 @@ NtorClientHandshake::complete_handshake(std::span<const uint8_t> server_response
         return std::unexpected(NtorError::AuthVerificationFailed);
     }
 
-    // Derive key material using HKDF
-    auto key_material = ntor_detail::hkdf_expand(secret_input, NTOR_EXPAND_STR,
+    // KEY_SEED = H(secret_input, t_key)
+    auto key_seed = ntor_detail::hmac_sha256(NTOR_KEY_STR, secret_input);
+
+    // Derive key material: HKDF-Expand(KEY_SEED, m_expand, needed_length)
+    auto key_material = ntor_detail::hkdf_expand(key_seed, NTOR_EXPAND_STR,
                                                   NtorKeyMaterial::TOTAL_LEN);
 
+    // Key layout (client perspective): Df | Db | Kf | Kb | KH
     NtorKeyMaterial keys;
     size_t offset = 0;
-    std::copy(key_material.begin() + offset,
-              key_material.begin() + offset + 16, keys.forward_key.begin());
-    offset += 16;
-    std::copy(key_material.begin() + offset,
-              key_material.begin() + offset + 16, keys.backward_key.begin());
-    offset += 16;
     std::copy(key_material.begin() + offset,
               key_material.begin() + offset + 20, keys.forward_digest.begin());
     offset += 20;
     std::copy(key_material.begin() + offset,
               key_material.begin() + offset + 20, keys.backward_digest.begin());
     offset += 20;
+    std::copy(key_material.begin() + offset,
+              key_material.begin() + offset + 16, keys.forward_key.begin());
+    offset += 16;
+    std::copy(key_material.begin() + offset,
+              key_material.begin() + offset + 16, keys.backward_key.begin());
+    offset += 16;
     std::copy(key_material.begin() + offset,
               key_material.begin() + offset + 20, keys.kh.begin());
 
@@ -223,7 +246,7 @@ NtorServerHandshake::process_request(
     }
     auto& ephemeral_key = *ephemeral_result;
 
-    // Compute shared secrets
+    // Compute shared secrets: server uses (X^y, X^b)
     auto exp_xy = ephemeral_key.diffie_hellman(client_ephemeral);
     if (!exp_xy) {
         return std::unexpected(NtorError::KeyDerivationFailed);
@@ -234,45 +257,50 @@ NtorServerHandshake::process_request(
         return std::unexpected(NtorError::KeyDerivationFailed);
     }
 
-    // Compute secret_input
+    // Compute raw secret_input
     auto secret_input = ntor_detail::compute_secret_input(
         *exp_xy, *exp_xb, our_node_id, our_onion_key.public_key(),
         client_ephemeral, ephemeral_key.public_key());
 
-    // Derive verify
+    // verify = H(secret_input, t_verify)
     auto verify = ntor_detail::hmac_sha256(NTOR_VERIFY_STR, secret_input);
 
-    // Compute auth
+    // auth = H(auth_input, t_mac)
     auto auth = ntor_detail::compute_auth(
         verify, our_node_id, our_onion_key.public_key(),
         ephemeral_key.public_key(), client_ephemeral);
 
-    // Build response
+    // Build response: Y(32) | AUTH(32)
     std::array<uint8_t, NTOR_SERVER_HANDSHAKE_LEN> response;
     std::copy(ephemeral_key.public_key().data().begin(),
               ephemeral_key.public_key().data().end(),
               response.begin());
     std::copy(auth.begin(), auth.end(), response.begin() + 32);
 
-    // Derive key material
-    auto key_material = ntor_detail::hkdf_expand(secret_input, NTOR_EXPAND_STR,
+    // KEY_SEED = H(secret_input, t_key)
+    auto key_seed = ntor_detail::hmac_sha256(NTOR_KEY_STR, secret_input);
+
+    // Derive key material: HKDF-Expand(KEY_SEED, m_expand, needed_length)
+    auto key_material = ntor_detail::hkdf_expand(key_seed, NTOR_EXPAND_STR,
                                                   NtorKeyMaterial::TOTAL_LEN);
 
+    // Key layout: Df | Db | Kf | Kb | KH (same as spec)
+    // CircuitCrypto uses forward=Kf (decrypt client→server), backward=Kb (encrypt server→client)
+    // so we do NOT swap labels here - just assign matching the spec ordering
     NtorKeyMaterial keys;
     size_t offset = 0;
-    // Note: Server uses backward as forward and vice versa
     std::copy(key_material.begin() + offset,
-              key_material.begin() + offset + 16, keys.backward_key.begin());
-    offset += 16;
-    std::copy(key_material.begin() + offset,
-              key_material.begin() + offset + 16, keys.forward_key.begin());
-    offset += 16;
+              key_material.begin() + offset + 20, keys.forward_digest.begin());
+    offset += 20;
     std::copy(key_material.begin() + offset,
               key_material.begin() + offset + 20, keys.backward_digest.begin());
     offset += 20;
     std::copy(key_material.begin() + offset,
-              key_material.begin() + offset + 20, keys.forward_digest.begin());
-    offset += 20;
+              key_material.begin() + offset + 16, keys.forward_key.begin());
+    offset += 16;
+    std::copy(key_material.begin() + offset,
+              key_material.begin() + offset + 16, keys.backward_key.begin());
+    offset += 16;
     std::copy(key_material.begin() + offset,
               key_material.begin() + offset + 20, keys.kh.begin());
 

@@ -27,7 +27,10 @@
 #include <iomanip>
 #include <chrono>
 #include <thread>
+#include <algorithm>
+#include <deque>
 #include <unordered_map>
+#include <arpa/inet.h>
 
 namespace tor::core {
 
@@ -315,30 +318,57 @@ struct CircuitCrypto {
     crypto::RunningDigest backward_digest; // create outgoing (Db)
 };
 
-// Helper: Decrypt and verify an incoming relay cell
-static std::optional<RelayCell> decrypt_relay_cell(
+// Next-hop connection state for EXTEND2 circuits
+struct NextHopState {
+    std::shared_ptr<Channel> channel;
+    std::atomic<bool> running{true};
+    std::thread reader_thread;
+
+    ~NextHopState() {
+        running = false;
+        if (channel) channel->close();
+        if (reader_thread.joinable()) reader_thread.join();
+    }
+};
+
+// Result of decrypting a relay cell at this hop
+struct DecryptResult {
+    enum class Type { ForUs, Forward, Error };
+    Type type{Type::Error};
+    std::array<uint8_t, PAYLOAD_LEN> decrypted_payload{};
+    std::optional<RelayCell> relay;  // Set only if type == ForUs
+};
+
+// Decrypt one layer and determine if cell is for us or should be forwarded
+static DecryptResult decrypt_relay_cell_or_forward(
     CircuitCrypto& crypto, const Cell& cell)
 {
-    // Copy payload for in-place decryption
-    std::array<uint8_t, PAYLOAD_LEN> payload = cell.payload;
+    DecryptResult result;
+    result.decrypted_payload = cell.payload;
 
-    // Decrypt with forward cipher (Kf)
+    // Decrypt with forward cipher (Kf) - always updates AES-CTR state
     auto dec = crypto.forward_cipher.process(
-        std::span<uint8_t>(payload.data(), PAYLOAD_LEN));
+        std::span<uint8_t>(result.decrypted_payload.data(), PAYLOAD_LEN));
     if (!dec) {
-        LOG_WARN("relay: AES decryption failed");
-        return std::nullopt;
+        result.type = DecryptResult::Type::Error;
+        return result;
     }
+
+    auto& payload = result.decrypted_payload;
 
     // Check recognized field (bytes 1-2)
     uint16_t recognized = (static_cast<uint16_t>(payload[1]) << 8) |
                            static_cast<uint16_t>(payload[2]);
     if (recognized != 0) {
-        LOG_WARN("relay: recognized field is {:04x}, not 0", recognized);
-        return std::nullopt;
+        // Not for us - forward to next hop (don't update running digest)
+        result.type = DecryptResult::Type::Forward;
+        return result;
     }
 
-    // Save and zero digest
+    // Clone digest state before updating (in case recognized=0 is coincidence)
+    auto digest_save = crypto.forward_digest.clone();
+
+    // Save and zero digest field
     uint32_t saved_digest = (static_cast<uint32_t>(payload[5]) << 24) |
                             (static_cast<uint32_t>(payload[6]) << 16) |
                             (static_cast<uint32_t>(payload[7]) << 8) |
@@ -348,18 +378,23 @@ static std::optional<RelayCell> decrypt_relay_cell(
     // Update forward running digest and verify
     auto computed = crypto.forward_digest.update_and_digest(
         std::span<const uint8_t>(payload.data(), PAYLOAD_LEN));
-    if (!computed) {
-        LOG_WARN("relay: digest computation failed");
-        return std::nullopt;
+    if (!computed || *computed != saved_digest) {
+        // Digest mismatch - recognized=0 was coincidence, forward the cell
+        // Restore the digest state
+        if (digest_save) {
+            crypto.forward_digest = std::move(*digest_save);
+        }
+        // Restore the digest bytes in payload for forwarding
+        payload[5] = static_cast<uint8_t>((saved_digest >> 24) & 0xFF);
+        payload[6] = static_cast<uint8_t>((saved_digest >> 16) & 0xFF);
+        payload[7] = static_cast<uint8_t>((saved_digest >> 8) & 0xFF);
+        payload[8] = static_cast<uint8_t>(saved_digest & 0xFF);
+        result.type = DecryptResult::Type::Forward;
+        return result;
     }
 
-    if (*computed != saved_digest) {
-        LOG_WARN("relay: digest mismatch: expected {:08x}, got {:08x}",
-                 saved_digest, *computed);
-        return std::nullopt;
-    }
-
-    // Parse relay header
+    // Cell is for us - parse relay header
+    result.type = DecryptResult::Type::ForUs;
     RelayCell relay;
     relay.command = static_cast<RelayCommand>(payload[0]);
     relay.recognized = recognized;
@@ -370,15 +405,18 @@ static std::optional<RelayCell> decrypt_relay_cell(
     uint16_t data_len = (static_cast<uint16_t>(payload[9]) << 8) |
                          static_cast<uint16_t>(payload[10]);
     if (data_len > PAYLOAD_LEN - RELAY_HEADER_LEN) {
-        LOG_WARN("relay: data length {} too large", data_len);
-        return std::nullopt;
+        result.type = DecryptResult::Type::Error;
+        return result;
     }
 
     relay.data.assign(payload.begin() + RELAY_HEADER_LEN,
                       payload.begin() + RELAY_HEADER_LEN + data_len);
+    result.relay = std::move(relay);
 
-    return relay;
+    return result;
 }
+
+
 
 // Helper: Build and encrypt an outgoing relay cell
 static Cell encrypt_relay_cell(
@@ -597,16 +635,29 @@ std::expected<void, RelayError> Relay::start() {
             // Circuit crypto state per circuit ID
             std::unordered_map<CircuitId, CircuitCrypto> circuits;
 
+            // Next-hop connections for extended circuits (EXTEND2)
+            std::unordered_map<CircuitId, std::unique_ptr<NextHopState>> next_hops;
+
             // Per-stream buffered HTTP request data
             std::unordered_map<StreamId, std::string> stream_bufs;
 
             // Per-stream TCP sockets for BEGIN-connected streams
             std::unordered_map<StreamId, int> stream_sockets;
 
-            // Circuit-level package window (informational only;
-            // we rely on TCP/TLS backpressure + pacing for flow control)
+            // Flow control windows
             int circuit_package_window = 1000;
-            int cells_sent_in_burst = 0;
+
+            // Per-stream package window (starts at 500 per Tor spec)
+            std::unordered_map<StreamId, int> stream_package_windows;
+
+            // Pending responses paused by flow control
+            struct PendingResponse {
+                CircuitId circ_id;
+                StreamId stream_id;
+                std::string data;
+                size_t offset;
+            };
+            std::deque<PendingResponse> pending_responses;
 
             // Pre-build bridge descriptor for directory requests
             std::string bridge_desc = build_bridge_descriptor(
@@ -766,15 +817,43 @@ std::expected<void, RelayError> Relay::start() {
                         continue;
                     }
 
-                    auto relay = decrypt_relay_cell(it->second, fixed);
-                    if (!relay) {
+                    CircuitId circ_id = fixed.circuit_id;
+                    auto& cc = it->second;
+
+                    // Decrypt one layer and decide: for us or forward?
+                    auto dr = decrypt_relay_cell_or_forward(cc, fixed);
+
+                    if (dr.type == DecryptResult::Type::Error) {
                         LOG_WARN("OR: failed to decrypt relay cell on circuit {}",
-                                 fixed.circuit_id);
+                                 circ_id);
                         continue;
                     }
 
-                    CircuitId circ_id = fixed.circuit_id;
-                    auto& cc = it->second;
+                    if (dr.type == DecryptResult::Type::Forward) {
+                        // Cell is not for us - forward to next hop
+                        auto nh_it = next_hops.find(circ_id);
+                        if (nh_it != next_hops.end() && nh_it->second->channel &&
+                            nh_it->second->channel->is_open()) {
+                            // Preserve RELAY_EARLY flag (required for EXTEND2 forwarding)
+                            Cell fwd(circ_id, fixed.command);
+                            fwd.payload = dr.decrypted_payload;
+                            auto sr = nh_it->second->channel->send(fwd);
+                            if (!sr) {
+                                LOG_WARN("OR: failed to forward relay cell to next hop on circuit {}",
+                                         circ_id);
+                            } else {
+                                LOG_INFO("OR: forwarded {} cell to next hop on circuit {}",
+                                         cell_command_name(fixed.command), circ_id);
+                            }
+                        } else {
+                            LOG_WARN("OR: no next hop for circuit {} to forward relay cell",
+                                     circ_id);
+                        }
+                        continue;
+                    }
+
+                    // Cell is for us
+                    auto& relay = dr.relay;
 
                     LOG_DEBUG("OR: relay cmd={} stream={} datalen={}",
                              static_cast<int>(relay->command),
@@ -795,6 +874,7 @@ std::expected<void, RelayError> Relay::start() {
                             LOG_WARN("OR: failed to send CONNECTED");
                         }
                         stream_bufs[relay->stream_id] = "";
+                        stream_package_windows[relay->stream_id] = 500;
                         continue;
                     }
 
@@ -909,13 +989,22 @@ std::expected<void, RelayError> Relay::start() {
                                         // Combine our headers + authority body
                                         std::string full_resp = our_http + proxy_body;
 
-                                        // Send response with pacing only (no inline SENDME blocking)
-                                        // TCP/TLS backpressure + pacing prevents buffer overflow.
-                                        // SENDMEs are processed in the normal cell loop after this.
+                                        // Send response respecting flow control windows.
+                                        // Circuit window starts at 1000 (decrement per cell, +100 per circuit SENDME).
+                                        // Stream window starts at 500 (decrement per cell, +50 per stream SENDME).
                                         const size_t mx = PAYLOAD_LEN - RELAY_HEADER_LEN;
                                         size_t off = 0;
                                         StreamId sid = relay->stream_id;
+                                        auto& stream_pkg = stream_package_windows[sid];
+
                                         while (off < full_resp.size() && channel->is_open()) {
+                                            if (circuit_package_window <= 0 || stream_pkg <= 0) {
+                                                // Window exhausted - save for later, SENDMEs will resume
+                                                pending_responses.push_back({circ_id, sid, full_resp, off});
+                                                LOG_DEBUG("OR: flow control pause at {}/{} bytes (circ_win={}, stream_win={})",
+                                                         off, full_resp.size(), circuit_package_window, stream_pkg);
+                                                break;
+                                            }
                                             size_t chk = std::min(mx, full_resp.size() - off);
                                             std::vector<uint8_t> cd(
                                                 full_resp.begin() + static_cast<std::ptrdiff_t>(off),
@@ -928,21 +1017,19 @@ std::expected<void, RelayError> Relay::start() {
                                                 break;
                                             }
                                             off += chk;
-                                            cells_sent_in_burst++;
-                                            // Yield every 50 cells to let TLS flush and
-                                            // give the client time to send SENDMEs
-                                            if (cells_sent_in_burst >= 50) {
-                                                cells_sent_in_burst = 0;
-                                                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                                            }
+                                            circuit_package_window--;
+                                            stream_pkg--;
                                         }
-                                        auto end_cell = encrypt_relay_cell(
-                                            cc, circ_id, RelayCommand::END, sid,
-                                            {static_cast<uint8_t>(EndReason::DONE)});
-                                        (void)channel->send(end_cell);
-                                        stream_bufs.erase(sit);
-                                        LOG_INFO("OR: sent proxied response ({} bytes, {} cells) to stream {}",
-                                                 full_resp.size(), full_resp.size() / mx + 1, sid);
+                                        if (off >= full_resp.size()) {
+                                            // Fully sent
+                                            auto end_cell = encrypt_relay_cell(
+                                                cc, circ_id, RelayCommand::END, sid,
+                                                {static_cast<uint8_t>(EndReason::DONE)});
+                                            (void)channel->send(end_cell);
+                                            stream_bufs.erase(sit);
+                                            LOG_INFO("OR: sent proxied response ({} bytes, {} cells) to stream {}",
+                                                     full_resp.size(), full_resp.size() / mx + 1, sid);
+                                        }
                                         continue;
                                     }
                                 }
@@ -998,6 +1085,8 @@ std::expected<void, RelayError> Relay::start() {
                                     break;
                                 }
                                 offset += chunk;
+                                circuit_package_window--;
+                                stream_package_windows[relay->stream_id]--;
                             }
 
                             LOG_INFO("OR: sent descriptor ({} bytes) to stream {}",
@@ -1126,6 +1215,14 @@ std::expected<void, RelayError> Relay::start() {
                     if (relay->command == RelayCommand::END) {
                         LOG_INFO("OR: END on stream {}", relay->stream_id);
                         stream_bufs.erase(relay->stream_id);
+                        stream_package_windows.erase(relay->stream_id);
+                        // Remove any pending responses for this stream
+                        pending_responses.erase(
+                            std::remove_if(pending_responses.begin(), pending_responses.end(),
+                                [&](const PendingResponse& pr) {
+                                    return pr.stream_id == relay->stream_id;
+                                }),
+                            pending_responses.end());
                         // Close any associated socket
                         auto sock_it = stream_sockets.find(relay->stream_id);
                         if (sock_it != stream_sockets.end()) {
@@ -1143,10 +1240,374 @@ std::expected<void, RelayError> Relay::start() {
                             LOG_DEBUG("OR: circuit SENDME on {}, window now {}",
                                      circ_id, circuit_package_window);
                         } else {
-                            // Stream-level SENDME (don't touch circuit window)
-                            LOG_DEBUG("OR: stream SENDME on stream {}",
-                                     relay->stream_id);
+                            // Stream-level SENDME
+                            auto sw_it = stream_package_windows.find(relay->stream_id);
+                            if (sw_it != stream_package_windows.end()) {
+                                sw_it->second += 50;
+                            }
+                            LOG_DEBUG("OR: stream SENDME on stream {}, window now {}",
+                                     relay->stream_id,
+                                     sw_it != stream_package_windows.end() ? sw_it->second : -1);
                         }
+
+                        // Resume any pending responses that now have window space
+                        for (auto pr_it = pending_responses.begin();
+                             pr_it != pending_responses.end(); ) {
+                            auto pr_circ_it = circuits.find(pr_it->circ_id);
+                            if (pr_circ_it == circuits.end()) {
+                                pr_it = pending_responses.erase(pr_it);
+                                continue;
+                            }
+                            auto& pr_cc = pr_circ_it->second;
+                            auto pr_sw = stream_package_windows.find(pr_it->stream_id);
+                            if (pr_sw == stream_package_windows.end()) {
+                                pr_it = pending_responses.erase(pr_it);
+                                continue;
+                            }
+
+                            if (circuit_package_window <= 0 || pr_sw->second <= 0) {
+                                ++pr_it;
+                                continue;
+                            }
+
+                            // Continue sending this response
+                            const size_t mx = PAYLOAD_LEN - RELAY_HEADER_LEN;
+                            bool send_ok = true;
+                            while (pr_it->offset < pr_it->data.size() &&
+                                   channel->is_open() &&
+                                   circuit_package_window > 0 &&
+                                   pr_sw->second > 0) {
+                                size_t chk = std::min(mx,
+                                    pr_it->data.size() - pr_it->offset);
+                                std::vector<uint8_t> cd(
+                                    pr_it->data.begin() + static_cast<std::ptrdiff_t>(pr_it->offset),
+                                    pr_it->data.begin() + static_cast<std::ptrdiff_t>(pr_it->offset + chk));
+                                auto dc = encrypt_relay_cell(
+                                    pr_cc, pr_it->circ_id, RelayCommand::DATA,
+                                    pr_it->stream_id, cd);
+                                auto sr = channel->send(dc);
+                                if (!sr) { send_ok = false; break; }
+                                pr_it->offset += chk;
+                                circuit_package_window--;
+                                pr_sw->second--;
+                            }
+
+                            if (!send_ok || pr_it->offset >= pr_it->data.size()) {
+                                if (pr_it->offset >= pr_it->data.size()) {
+                                    // Fully sent - send END
+                                    auto end_cell = encrypt_relay_cell(
+                                        pr_cc, pr_it->circ_id, RelayCommand::END,
+                                        pr_it->stream_id,
+                                        {static_cast<uint8_t>(EndReason::DONE)});
+                                    (void)channel->send(end_cell);
+                                    stream_bufs.erase(pr_it->stream_id);
+                                    LOG_INFO("OR: completed response ({} bytes) to stream {}",
+                                             pr_it->data.size(), pr_it->stream_id);
+                                }
+                                pr_it = pending_responses.erase(pr_it);
+                            } else {
+                                LOG_DEBUG("OR: response still pending for stream {} ({}/{})",
+                                         pr_it->stream_id, pr_it->offset, pr_it->data.size());
+                                ++pr_it;
+                            }
+                        }
+                        continue;
+                    }
+
+                    // Handle EXTEND2 (circuit extension through this relay)
+                    if (relay->command == RelayCommand::EXTEND2) {
+                        LOG_INFO("OR: EXTEND2 on circuit {}", circ_id);
+
+                        auto& data = relay->data;
+                        size_t pos = 0;
+
+                        // Parse link specifiers
+                        if (pos >= data.size()) {
+                            LOG_WARN("OR: EXTEND2 too short");
+                            continue;
+                        }
+                        uint8_t nspec = data[pos++];
+                        std::string target_ip;
+                        uint16_t target_port = 0;
+
+                        for (uint8_t i = 0; i < nspec && pos + 2 <= data.size(); ++i) {
+                            uint8_t lstype = data[pos++];
+                            uint8_t lslen = data[pos++];
+                            if (pos + lslen > data.size()) break;
+
+                            if (lstype == 0 && lslen == 6) {
+                                // IPv4: 4 bytes IP + 2 bytes port
+                                char ip_buf[INET_ADDRSTRLEN];
+                                struct in_addr addr;
+                                memcpy(&addr, &data[pos], 4);
+                                inet_ntop(AF_INET, &addr, ip_buf, sizeof(ip_buf));
+                                target_ip = ip_buf;
+                                target_port = (static_cast<uint16_t>(data[pos+4]) << 8) |
+                                               static_cast<uint16_t>(data[pos+5]);
+                            } else if (lstype == 1 && lslen == 18) {
+                                // IPv6: 16 bytes IP + 2 bytes port
+                                char ip_buf[INET6_ADDRSTRLEN];
+                                struct in6_addr addr;
+                                memcpy(&addr, &data[pos], 16);
+                                inet_ntop(AF_INET6, &addr, ip_buf, sizeof(ip_buf));
+                                target_ip = ip_buf;
+                                target_port = (static_cast<uint16_t>(data[pos+16]) << 8) |
+                                               static_cast<uint16_t>(data[pos+17]);
+                            }
+                            pos += lslen;
+                        }
+
+                        if (target_ip.empty() || target_port == 0) {
+                            LOG_WARN("OR: EXTEND2 no usable address found");
+                            auto end_cell = encrypt_relay_cell(
+                                cc, circ_id, RelayCommand::TRUNCATED, 0,
+                                {static_cast<uint8_t>(DestroyReason::INTERNAL)});
+                            (void)channel->send(end_cell);
+                            continue;
+                        }
+
+                        // Parse CREATE2 handshake data
+                        if (pos + 4 > data.size()) {
+                            LOG_WARN("OR: EXTEND2 missing handshake data");
+                            auto end_cell = encrypt_relay_cell(
+                                cc, circ_id, RelayCommand::TRUNCATED, 0,
+                                {static_cast<uint8_t>(DestroyReason::INTERNAL)});
+                            (void)channel->send(end_cell);
+                            continue;
+                        }
+                        uint16_t htype = (static_cast<uint16_t>(data[pos]) << 8) |
+                                          static_cast<uint16_t>(data[pos+1]);
+                        uint16_t hlen = (static_cast<uint16_t>(data[pos+2]) << 8) |
+                                         static_cast<uint16_t>(data[pos+3]);
+                        pos += 4;
+                        if (pos + hlen > data.size()) {
+                            LOG_WARN("OR: EXTEND2 handshake data truncated");
+                            auto end_cell = encrypt_relay_cell(
+                                cc, circ_id, RelayCommand::TRUNCATED, 0,
+                                {static_cast<uint8_t>(DestroyReason::INTERNAL)});
+                            (void)channel->send(end_cell);
+                            continue;
+                        }
+                        std::vector<uint8_t> hdata(data.begin() + pos,
+                                                   data.begin() + pos + hlen);
+
+                        LOG_INFO("OR: EXTEND2 target={}:{} htype={} hlen={}",
+                                 target_ip, target_port, htype, hlen);
+
+                        // Connect to target relay via TLS
+                        boost::asio::io_context ext_io;
+                        crypto::TlsContext ext_tls;
+                        auto ext_tls_init = ext_tls.init_client();
+                        if (!ext_tls_init) {
+                            LOG_WARN("OR: EXTEND2 TLS client init failed");
+                            auto end_cell = encrypt_relay_cell(
+                                cc, circ_id, RelayCommand::TRUNCATED, 0,
+                                {static_cast<uint8_t>(DestroyReason::CONNECTFAILED)});
+                            (void)channel->send(end_cell);
+                            continue;
+                        }
+
+                        auto ext_conn = std::make_shared<net::TlsConnection>(ext_io, ext_tls);
+                        ext_conn->set_connect_timeout(std::chrono::milliseconds(10000));
+                        auto conn_result = ext_conn->connect(target_ip, target_port);
+                        if (!conn_result) {
+                            LOG_WARN("OR: EXTEND2 TCP connect to {}:{} failed",
+                                     target_ip, target_port);
+                            auto end_cell = encrypt_relay_cell(
+                                cc, circ_id, RelayCommand::TRUNCATED, 0,
+                                {static_cast<uint8_t>(DestroyReason::CONNECTFAILED)});
+                            (void)channel->send(end_cell);
+                            continue;
+                        }
+
+                        auto tls_result = ext_conn->tls_handshake(true);
+                        if (!tls_result) {
+                            LOG_WARN("OR: EXTEND2 TLS handshake to {}:{} failed",
+                                     target_ip, target_port);
+                            auto end_cell = encrypt_relay_cell(
+                                cc, circ_id, RelayCommand::TRUNCATED, 0,
+                                {static_cast<uint8_t>(DestroyReason::CONNECTFAILED)});
+                            (void)channel->send(end_cell);
+                            continue;
+                        }
+
+                        // Create channel for next hop
+                        auto nh_channel = std::make_shared<Channel>();
+                        nh_channel->set_connection(ext_conn);
+
+                        // Tor link protocol as initiator:
+                        // 1. Send VERSIONS (using 2-byte circuit IDs initially)
+                        std::vector<uint8_t> versions_payload = {0, 3, 0, 4, 0, 5};
+                        VariableCell versions_cell(0, CellCommand::VERSIONS,
+                                                   versions_payload);
+                        auto vs_result = nh_channel->send(versions_cell);
+                        if (!vs_result) {
+                            LOG_WARN("OR: EXTEND2 failed to send VERSIONS");
+                            auto end_cell = encrypt_relay_cell(
+                                cc, circ_id, RelayCommand::TRUNCATED, 0,
+                                {static_cast<uint8_t>(DestroyReason::INTERNAL)});
+                            (void)channel->send(end_cell);
+                            continue;
+                        }
+
+                        // 2. Receive VERSIONS from target
+                        auto nh_versions = nh_channel->receive_variable();
+                        if (!nh_versions) {
+                            LOG_WARN("OR: EXTEND2 failed to receive VERSIONS from target");
+                            auto end_cell = encrypt_relay_cell(
+                                cc, circ_id, RelayCommand::TRUNCATED, 0,
+                                {static_cast<uint8_t>(DestroyReason::INTERNAL)});
+                            (void)channel->send(end_cell);
+                            continue;
+                        }
+
+                        // Negotiate v4+
+                        nh_channel->set_link_version(4);
+
+                        // 3. Receive CERTS, AUTH_CHALLENGE, NETINFO (consume them)
+                        for (int rx = 0; rx < 3; ++rx) {
+                            auto any = nh_channel->receive_any();
+                            if (!any) {
+                                LOG_WARN("OR: EXTEND2 failed to receive cell {} from target", rx);
+                                break;
+                            }
+                        }
+
+                        // 4. Send NETINFO
+                        {
+                            Cell netinfo(0, CellCommand::NETINFO);
+                            netinfo.payload.fill(0);
+                            // TIME (4 bytes) - current time
+                            auto now = std::chrono::system_clock::now();
+                            auto epoch = std::chrono::duration_cast<std::chrono::seconds>(
+                                now.time_since_epoch()).count();
+                            netinfo.payload[0] = static_cast<uint8_t>((epoch >> 24) & 0xFF);
+                            netinfo.payload[1] = static_cast<uint8_t>((epoch >> 16) & 0xFF);
+                            netinfo.payload[2] = static_cast<uint8_t>((epoch >> 8) & 0xFF);
+                            netinfo.payload[3] = static_cast<uint8_t>(epoch & 0xFF);
+                            // OTHERADDR: type=4(IPv4), len=4, addr
+                            netinfo.payload[4] = 4; // IPv4
+                            netinfo.payload[5] = 4; // length
+                            struct in_addr target_addr;
+                            inet_pton(AF_INET, target_ip.c_str(), &target_addr);
+                            memcpy(&netinfo.payload[6], &target_addr, 4);
+                            // NUMADDR = 1
+                            netinfo.payload[10] = 1;
+                            // MYADDR: type=4, len=4, 127.0.0.1
+                            netinfo.payload[11] = 4;
+                            netinfo.payload[12] = 4;
+                            netinfo.payload[13] = 127;
+                            netinfo.payload[16] = 1;
+                            auto ni_result = nh_channel->send(netinfo);
+                            if (!ni_result) {
+                                LOG_WARN("OR: EXTEND2 failed to send NETINFO");
+                            }
+                        }
+
+                        nh_channel->set_state(ChannelState::Open);
+
+                        // 5. Send CREATE2 to target
+                        {
+                            Cell create2(circ_id, CellCommand::CREATE2);
+                            create2.payload.fill(0);
+                            create2.payload[0] = static_cast<uint8_t>(htype >> 8);
+                            create2.payload[1] = static_cast<uint8_t>(htype & 0xFF);
+                            create2.payload[2] = static_cast<uint8_t>(hlen >> 8);
+                            create2.payload[3] = static_cast<uint8_t>(hlen & 0xFF);
+                            std::memcpy(create2.payload.data() + 4, hdata.data(),
+                                        hdata.size());
+                            auto c2_result = nh_channel->send(create2);
+                            if (!c2_result) {
+                                LOG_WARN("OR: EXTEND2 failed to send CREATE2 to target");
+                                auto end_cell = encrypt_relay_cell(
+                                    cc, circ_id, RelayCommand::TRUNCATED, 0,
+                                    {static_cast<uint8_t>(DestroyReason::INTERNAL)});
+                                (void)channel->send(end_cell);
+                                continue;
+                            }
+                        }
+
+                        // 6. Receive CREATED2 from target
+                        auto created2_cell = nh_channel->receive();
+                        if (!created2_cell ||
+                            created2_cell->command != CellCommand::CREATED2) {
+                            LOG_WARN("OR: EXTEND2 failed to receive CREATED2 from target");
+                            auto end_cell = encrypt_relay_cell(
+                                cc, circ_id, RelayCommand::TRUNCATED, 0,
+                                {static_cast<uint8_t>(DestroyReason::INTERNAL)});
+                            (void)channel->send(end_cell);
+                            continue;
+                        }
+
+                        // 7. Send EXTENDED2 back to client
+                        // EXTENDED2 payload: HLEN(2) | HDATA(HLEN)
+                        // Extract HLEN from CREATED2
+                        uint16_t resp_hlen =
+                            (static_cast<uint16_t>(created2_cell->payload[0]) << 8) |
+                             static_cast<uint16_t>(created2_cell->payload[1]);
+                        std::vector<uint8_t> ext2_data;
+                        ext2_data.push_back(created2_cell->payload[0]);
+                        ext2_data.push_back(created2_cell->payload[1]);
+                        ext2_data.insert(ext2_data.end(),
+                                         created2_cell->payload.begin() + 2,
+                                         created2_cell->payload.begin() + 2 + resp_hlen);
+
+                        auto ext2_cell = encrypt_relay_cell(
+                            cc, circ_id, RelayCommand::EXTENDED2, 0, ext2_data);
+                        auto ext2_result = channel->send(ext2_cell);
+                        if (!ext2_result) {
+                            LOG_WARN("OR: EXTEND2 failed to send EXTENDED2 to client");
+                            continue;
+                        }
+
+                        LOG_INFO("OR: EXTEND2 success on circuit {} → {}:{}",
+                                 circ_id, target_ip, target_port);
+
+                        // 8. Start backward relay cell reader for this next hop
+                        auto nh = std::make_unique<NextHopState>();
+                        nh->channel = nh_channel;
+                        auto nh_running = &nh->running;
+                        auto client_channel = channel;
+                        auto circ_id_copy = circ_id;
+
+                        // Store circuits ref for backward encryption
+                        auto circuits_ptr = &circuits;
+
+                        nh->reader_thread = std::thread(
+                            [nh_channel, client_channel, circ_id_copy,
+                             nh_running, circuits_ptr]() {
+                            while (nh_running->load() &&
+                                   nh_channel->is_open() &&
+                                   client_channel->is_open()) {
+                                auto cell = nh_channel->receive();
+                                if (!cell) break;
+
+                                if (cell->command == CellCommand::DESTROY) {
+                                    LOG_INFO("OR: next hop destroyed circuit {}",
+                                             circ_id_copy);
+                                    break;
+                                }
+
+                                if (cell->command == CellCommand::RELAY) {
+                                    // Backward direction: encrypt with Kb
+                                    auto c_it = circuits_ptr->find(circ_id_copy);
+                                    if (c_it == circuits_ptr->end()) break;
+
+                                    Cell back_cell(circ_id_copy, CellCommand::RELAY);
+                                    back_cell.payload = cell->payload;
+                                    // Encrypt payload with backward cipher (Kb)
+                                    auto enc = c_it->second.backward_cipher.process(
+                                        std::span<uint8_t>(back_cell.payload.data(),
+                                                           PAYLOAD_LEN));
+                                    if (!enc) break;
+
+                                    auto sr = client_channel->send(back_cell);
+                                    if (!sr) break;
+                                }
+                            }
+                        });
+
+                        next_hops.emplace(circ_id, std::move(nh));
                         continue;
                     }
 
@@ -1159,7 +1620,15 @@ std::expected<void, RelayError> Relay::start() {
                 // --- DESTROY ---
                 if (fixed.command == CellCommand::DESTROY) {
                     LOG_INFO("OR: DESTROY circuit {}", fixed.circuit_id);
+                    next_hops.erase(fixed.circuit_id);  // Clean up next hop
                     circuits.erase(fixed.circuit_id);
+                    // Clean up pending responses for this circuit
+                    pending_responses.erase(
+                        std::remove_if(pending_responses.begin(), pending_responses.end(),
+                            [&](const PendingResponse& pr) {
+                                return pr.circ_id == fixed.circuit_id;
+                            }),
+                        pending_responses.end());
                     continue;
                 }
 

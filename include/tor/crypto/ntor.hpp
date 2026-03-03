@@ -21,24 +21,32 @@ inline constexpr std::array<uint8_t, 24> NTOR_PROTO_ID = {
     '5', '1', '9', '-', 's', 'h', 'a', '2', '5', '6', '-', '1'
 };
 
-// Server string constant
-inline constexpr std::array<uint8_t, 15> NTOR_SERVER_STR = {
-    'S', 'e', 'r', 'v', 'e', 'r', ' ', 'k', 'e', 'y', ' ', 'd', 'a', 't', 'a'
+// Server string constant: "Server"
+inline constexpr std::array<uint8_t, 6> NTOR_SERVER_STR = {
+    'S', 'e', 'r', 'v', 'e', 'r'
 };
 
-// Expand string constant
-inline constexpr std::array<uint8_t, 18> NTOR_EXPAND_STR = {
-    'n', 't', 'o', 'r', '-', 'c', 'u', 'r', 'v', 'e',
-    '2', '5', '5', '1', '9', '-', '1', ':'
+// t_key = PROTOID | ":key_extract" (for KEY_SEED derivation)
+inline constexpr std::array<uint8_t, 36> NTOR_KEY_STR = {
+    'n', 't', 'o', 'r', '-', 'c', 'u', 'r', 'v', 'e', '2', '5',
+    '5', '1', '9', '-', 's', 'h', 'a', '2', '5', '6', '-', '1',
+    ':', 'k', 'e', 'y', '_', 'e', 'x', 't', 'r', 'a', 'c', 't'
 };
 
-// MAC string constant
+// m_expand = PROTOID | ":key_expand" (HKDF info for key expansion)
+inline constexpr std::array<uint8_t, 35> NTOR_EXPAND_STR = {
+    'n', 't', 'o', 'r', '-', 'c', 'u', 'r', 'v', 'e', '2', '5',
+    '5', '1', '9', '-', 's', 'h', 'a', '2', '5', '6', '-', '1',
+    ':', 'k', 'e', 'y', '_', 'e', 'x', 'p', 'a', 'n', 'd'
+};
+
+// t_mac = PROTOID | ":mac"
 inline constexpr std::array<uint8_t, 28> NTOR_MAC_STR = {
     'n', 't', 'o', 'r', '-', 'c', 'u', 'r', 'v', 'e', '2', '5', '5', '1',
     '9', '-', 's', 'h', 'a', '2', '5', '6', '-', '1', ':', 'm', 'a', 'c'
 };
 
-// Verify string constant
+// t_verify = PROTOID | ":verify"
 inline constexpr std::array<uint8_t, 31> NTOR_VERIFY_STR = {
     'n', 't', 'o', 'r', '-', 'c', 'u', 'r', 'v', 'e', '2', '5', '5', '1',
     '9', '-', 's', 'h', 'a', '2', '5', '6', '-', '1', ':', 'v', 'e', 'r',
@@ -131,8 +139,8 @@ namespace ntor_detail {
     size_t length
 );
 
-// Compute secret_input for ntor
-[[nodiscard]] std::array<uint8_t, 32> compute_secret_input(
+// Compute raw secret_input concatenation for ntor
+[[nodiscard]] std::vector<uint8_t> compute_secret_input(
     const std::array<uint8_t, 32>& exp_xy,
     const std::array<uint8_t, 32>& exp_xb,
     const NodeId& node_id,
