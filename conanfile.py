@@ -1,5 +1,8 @@
+import os
+
 from conan import ConanFile
 from conan.tools.cmake import CMake, CMakeToolchain, CMakeDeps, cmake_layout
+from conan.tools.files import copy
 
 
 class TorRelaysConan(ConanFile):
@@ -9,13 +12,17 @@ class TorRelaysConan(ConanFile):
     license = "Proprietary"
     url = "https://github.com/scorpiondefense/tor_relays"
     settings = "os", "compiler", "build_type", "arch"
-    exports_sources = (
-        "CMakeLists.txt",
-        "cmake/*",
-        "src/*",
-        "include/*",
-        "tests/*",
-    )
+
+    def export_sources(self):
+        copy(self, "CMakeLists.txt", src=self.recipe_folder, dst=self.export_sources_folder)
+        copy(self, "cmake/*", src=self.recipe_folder, dst=self.export_sources_folder)
+        copy(self, "src/*", src=self.recipe_folder, dst=self.export_sources_folder)
+        copy(self, "include/*", src=self.recipe_folder, dst=self.export_sources_folder)
+        copy(self, "tests/*", src=self.recipe_folder, dst=self.export_sources_folder)
+        # Include obfs4_cpp dependency sources alongside tor_relays
+        obfs4_src = os.path.join(self.recipe_folder, "..", "obfs4_cpp")
+        if os.path.exists(obfs4_src):
+            copy(self, "*", src=obfs4_src, dst=os.path.join(self.export_sources_folder, "obfs4_cpp"))
 
     # Migrated from conanfile.txt
     def requirements(self):

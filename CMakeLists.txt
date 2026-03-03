@@ -44,7 +44,14 @@ if(EXISTS "${CMAKE_BINARY_DIR}/conanbuildinfo.cmake")
 endif()
 
 # Add obfs4_cpp library (standalone obfs4 transport implementation)
-add_subdirectory(${CMAKE_SOURCE_DIR}/../obfs4_cpp ${CMAKE_BINARY_DIR}/obfs4_cpp)
+# Check Conan-exported path first, then monorepo sibling path
+if(EXISTS "${CMAKE_SOURCE_DIR}/obfs4_cpp/CMakeLists.txt")
+    add_subdirectory(${CMAKE_SOURCE_DIR}/obfs4_cpp ${CMAKE_BINARY_DIR}/obfs4_cpp)
+elseif(EXISTS "${CMAKE_SOURCE_DIR}/../obfs4_cpp/CMakeLists.txt")
+    add_subdirectory(${CMAKE_SOURCE_DIR}/../obfs4_cpp ${CMAKE_BINARY_DIR}/obfs4_cpp)
+else()
+    message(FATAL_ERROR "obfs4_cpp not found at ${CMAKE_SOURCE_DIR}/obfs4_cpp or ${CMAKE_SOURCE_DIR}/../obfs4_cpp")
+endif()
 
 # Source files
 set(TOR_SOURCES
