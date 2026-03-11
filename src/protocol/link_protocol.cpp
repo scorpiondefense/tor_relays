@@ -4,8 +4,24 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <sstream>
+#include <iomanip>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
+
+namespace {
+std::string hex_dump(const std::vector<uint8_t>& data, size_t max_bytes = 128) {
+    std::ostringstream oss;
+    size_t len = std::min(data.size(), max_bytes);
+    for (size_t i = 0; i < len; ++i) {
+        oss << std::hex << std::setw(2) << std::setfill('0')
+            << static_cast<int>(data[i]);
+        if (i + 1 < len) oss << ' ';
+    }
+    if (data.size() > max_bytes) oss << " ... (" << data.size() << " total)";
+    return oss.str();
+}
+} // anonymous namespace
 
 namespace tor::protocol {
 
@@ -204,7 +220,13 @@ CertsHandler::create_certs_cell(
     payload.write_u16(static_cast<uint16_t>(cert7->size()));
     payload.write_bytes(*cert7);
 
-    return core::VariableCell(0, core::CellCommand::CERTS, payload.take());
+    LOG_INFO("OR CERTS debug: cert2(RSA Identity) len={} hex={}", cert2->size(), hex_dump(*cert2));
+    LOG_INFO("OR CERTS debug: cert4(Ed25519 Signing) len={} hex={}", cert4.size(), hex_dump(cert4));
+    LOG_INFO("OR CERTS debug: cert5(TLS Link) len={} hex={}", cert5.size(), hex_dump(cert5));
+    LOG_INFO("OR CERTS debug: cert7(RSA-Ed Cross) len={} hex={}", cert7->size(), hex_dump(*cert7));
+    auto final_payload = payload.take();
+    LOG_INFO("OR CERTS debug: full payload len={}", final_payload.size());
+    return core::VariableCell(0, core::CellCommand::CERTS, std::move(final_payload));
 }
 
 std::expected<std::vector<crypto::TorCertificate>, LinkProtocolError>
