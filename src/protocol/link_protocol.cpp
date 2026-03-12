@@ -221,12 +221,56 @@ CertsHandler::create_certs_cell(
     payload.write_u16(static_cast<uint16_t>(cert7->size()));
     payload.write_bytes(*cert7);
 
-    LOG_INFO("OR CERTS debug: cert2(RSA Identity) len={} hex={}", cert2->size(), hex_dump(*cert2));
-    LOG_INFO("OR CERTS debug: cert4(Ed25519 Signing) len={} hex={}", cert4.size(), hex_dump(cert4));
-    LOG_INFO("OR CERTS debug: cert5(TLS Link) len={} hex={}", cert5.size(), hex_dump(cert5));
-    LOG_INFO("OR CERTS debug: cert7(RSA-Ed Cross) len={} hex={}", cert7->size(), hex_dump(*cert7));
+    // Debug: log cert sizes and key diagnostics
+    {
+        // SHA256 of TLS cert DER (what goes into Type 5 certified key)
+        std::array<uint8_t, 32> tls_sha;
+        SHA256(tls_cert_der.data(), tls_cert_der.size(), tls_sha.data());
+        std::vector<uint8_t> tls_sha_vec(tls_sha.begin(), tls_sha.end());
+        LOG_INFO("CERTS: TLS cert DER len={}, SHA256={}", tls_cert_der.size(), hex_dump(tls_sha_vec));
+
+        // Identity key
+        auto id_span = identity_pub.as_span();
+        std::vector<uint8_t> id_vec(id_span.begin(), id_span.end());
+        LOG_INFO("CERTS: identity_pub={}", hex_dump(id_vec));
+
+        // Signing key
+        auto sk_span = signing_pub.as_span();
+        std::vector<uint8_t> sk_vec(sk_span.begin(), sk_span.end());
+        LOG_INFO("CERTS: signing_pub={}", hex_dump(sk_vec));
+
+        // Cert sizes
+        LOG_INFO("CERTS: cert2(RSA)={} cert4(Ed-Sign)={} cert5(TLS-Link)={} cert7(Cross)={}",
+                 cert2->size(), cert4.size(), cert5.size(), cert7->size());
+
+        // Verify our own Type 4 cert signature (self-check)
+        if (cert4.size() >= 64) {
+            auto body4 = std::span<const uint8_t>(cert4.data(), cert4.size() - 64);
+            auto sig4 = std::span<const uint8_t>(cert4.data() + cert4.size() - 64, 64);
+            bool valid4 = identity_pub.verify(body4, sig4);
+            LOG_INFO("CERTS: Type4 self-verify={}", valid4 ? "PASS" : "FAIL");
+        }
+
+        // Verify our own Type 5 cert signature (self-check)
+        if (cert5.size() >= 64) {
+            auto body5 = std::span<const uint8_t>(cert5.data(), cert5.size() - 64);
+            auto sig5 = std::span<const uint8_t>(cert5.data() + cert5.size() - 64, 64);
+            bool valid5 = signing_pub.verify(body5, sig5);
+            LOG_INFO("CERTS: Type5 self-verify={}", valid5 ? "PASS" : "FAIL");
+        }
+
+        // Type 5 certified key (should match TLS SHA256)
+        if (cert5.size() >= 39) {
+            // cert5 body: VERSION(1) + CERT_TYPE(1) + EXPIRATION(4) + KEY_TYPE(1) + CERTIFIED_KEY(32)
+            std::vector<uint8_t> cert5_key(cert5.begin() + 7, cert5.begin() + 39);
+            LOG_INFO("CERTS: Type5 certified_key={}", hex_dump(cert5_key));
+            bool sha_match = (cert5_key == tls_sha_vec);
+            LOG_INFO("CERTS: TLS SHA256 match={}", sha_match ? "PASS" : "FAIL");
+        }
+    }
+
     auto final_payload = payload.take();
-    LOG_INFO("OR CERTS debug: full payload len={}", final_payload.size());
+    LOG_INFO("CERTS: full CERTS cell payload len={}", final_payload.size());
     return core::VariableCell(0, core::CellCommand::CERTS, std::move(final_payload));
 }
 

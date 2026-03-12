@@ -594,6 +594,9 @@ Rsa1024Identity::create_identity_cert() const {
         return std::unexpected(KeyError::OpenSSLError);
     }
 
+    // X.509 v3 (version field = 2) per tor-spec §4.2
+    X509_set_version(x509, 2);
+
     // Random serial number (avoid fingerprinting)
     {
         uint8_t serial_bytes[8];

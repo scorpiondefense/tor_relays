@@ -159,6 +159,9 @@ TlsContext::generate_self_signed_cert(const Ed25519SecretKey& identity_key) {
         return std::unexpected(TlsError::CertificateLoadFailed);
     }
 
+    // X.509 v3 (version field = 2) — matches standard Tor TLS certs
+    X509_set_version(x509, 2);
+
     // Set random serial number (avoid fingerprinting with fixed serial)
     {
         uint8_t serial_bytes[8];
@@ -417,36 +420,41 @@ std::expected<size_t, TlsError> TlsConnection::write(std::span<const uint8_t> da
         return std::unexpected(TlsError::WriteFailed);
     }
 
-    for (int attempts = 0; attempts < 100; ++attempts) {
-        int result = SSL_write(static_cast<SSL*>(ssl_), data.data(),
-                               static_cast<int>(data.size()));
-        if (result > 0) {
-            return static_cast<size_t>(result);
-        }
-
-        int err = SSL_get_error(static_cast<SSL*>(ssl_), result);
-        if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
-            int fd = SSL_get_fd(static_cast<SSL*>(ssl_));
-            fd_set fds;
-            FD_ZERO(&fds);
-            FD_SET(fd, &fds);
-            struct timeval tv = {10, 0}; // 10 second timeout for writes
-            int sel_result;
-            if (err == SSL_ERROR_WANT_READ) {
-                sel_result = select(fd + 1, &fds, nullptr, nullptr, &tv);
-            } else {
-                sel_result = select(fd + 1, nullptr, &fds, nullptr, &tv);
+    size_t total_written = 0;
+    while (total_written < data.size()) {
+        for (int attempts = 0; attempts < 100; ++attempts) {
+            int result = SSL_write(static_cast<SSL*>(ssl_),
+                                   data.data() + total_written,
+                                   static_cast<int>(data.size() - total_written));
+            if (result > 0) {
+                total_written += static_cast<size_t>(result);
+                break;
             }
-            if (sel_result <= 0) {
-                return std::unexpected(TlsError::WriteFailed);
-            }
-            continue;
-        }
 
-        return std::unexpected(TlsError::WriteFailed);
+            int err = SSL_get_error(static_cast<SSL*>(ssl_), result);
+            if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+                int fd = SSL_get_fd(static_cast<SSL*>(ssl_));
+                fd_set fds;
+                FD_ZERO(&fds);
+                FD_SET(fd, &fds);
+                struct timeval tv = {10, 0}; // 10 second timeout for writes
+                int sel_result;
+                if (err == SSL_ERROR_WANT_READ) {
+                    sel_result = select(fd + 1, &fds, nullptr, nullptr, &tv);
+                } else {
+                    sel_result = select(fd + 1, nullptr, &fds, nullptr, &tv);
+                }
+                if (sel_result <= 0) {
+                    return std::unexpected(TlsError::WriteFailed);
+                }
+                continue;
+            }
+
+            return std::unexpected(TlsError::WriteFailed);
+        }
     }
 
-    return std::unexpected(TlsError::WriteFailed);
+    return total_written;
 }
 
 std::expected<void, TlsError> TlsConnection::shutdown() {
