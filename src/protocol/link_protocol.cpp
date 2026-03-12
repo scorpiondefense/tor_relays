@@ -110,8 +110,9 @@ static std::vector<uint8_t> build_ed25519_cert(
         writer.write_u8(1); // N_EXTENSIONS = 1
 
         // Extension: SignedWithEd25519Key (type 4)
-        // ExtLen = 1 (ExtType) + 1 (ExtFlags) + 32 (Ed25519 key) = 34
-        uint16_t ext_data_len = 34;
+        // ExtLen = length of union body only (NOT including ExtType/ExtFlags)
+        // Per trunnel: ext_length is the byte count of just the data
+        uint16_t ext_data_len = 32;
         writer.write_u16(ext_data_len);
         writer.write_u8(4);  // ExtType = SignedWithEd25519Key
         writer.write_u8(1);  // ExtFlags = AFFECTS_VALIDATION
