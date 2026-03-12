@@ -42,11 +42,13 @@ static std::vector<uint8_t> kdf_tor(const uint8_t* k0, size_t k0_len) {
     result.reserve(100); // 5 * 20
     for (uint8_t i = 0; i < 5; ++i) {
         uint8_t digest[20];
-        SHA_CTX ctx;
-        SHA1_Init(&ctx);
-        SHA1_Update(&ctx, k0, k0_len);
-        SHA1_Update(&ctx, &i, 1);
-        SHA1_Final(digest, &ctx);
+        unsigned int digest_len = sizeof(digest);
+        EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+        EVP_DigestInit_ex(ctx, EVP_sha1(), nullptr);
+        EVP_DigestUpdate(ctx, k0, k0_len);
+        EVP_DigestUpdate(ctx, &i, 1);
+        EVP_DigestFinal_ex(ctx, digest, &digest_len);
+        EVP_MD_CTX_free(ctx);
         result.insert(result.end(), digest, digest + 20);
     }
     return result; // 100 bytes, use first 92
