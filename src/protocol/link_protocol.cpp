@@ -114,7 +114,7 @@ static std::vector<uint8_t> build_ed25519_cert(
         uint16_t ext_data_len = 34;
         writer.write_u16(ext_data_len);
         writer.write_u8(4);  // ExtType = SignedWithEd25519Key
-        writer.write_u8(0);  // ExtFlags = 0
+        writer.write_u8(1);  // ExtFlags = AFFECTS_VALIDATION
         writer.write_bytes(signer_key_for_ext->as_span());
     } else {
         writer.write_u8(0); // N_EXTENSIONS = 0

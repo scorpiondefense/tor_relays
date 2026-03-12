@@ -4,9 +4,12 @@
 #include <openssl/err.h>
 #include <openssl/x509.h>
 #include <openssl/pem.h>
+#include <openssl/rand.h>
 #include <cstring>
 #include <cerrno>
 #include <sys/select.h>
+#include <sstream>
+#include <iomanip>
 
 namespace tor::crypto {
 
@@ -156,22 +159,49 @@ TlsContext::generate_self_signed_cert(const Ed25519SecretKey& identity_key) {
         return std::unexpected(TlsError::CertificateLoadFailed);
     }
 
-    // Set serial number
-    ASN1_INTEGER_set(X509_get_serialNumber(x509), 1);
+    // Set random serial number (avoid fingerprinting with fixed serial)
+    {
+        uint8_t serial_bytes[8];
+        RAND_bytes(serial_bytes, sizeof(serial_bytes));
+        BIGNUM* bn_serial = BN_bin2bn(serial_bytes, sizeof(serial_bytes), nullptr);
+        if (bn_serial) {
+            BN_to_ASN1_INTEGER(bn_serial, X509_get_serialNumber(x509));
+            BN_free(bn_serial);
+        }
+    }
 
-    // Set validity (1 year)
-    X509_gmtime_adj(X509_get_notBefore(x509), 0);
-    X509_gmtime_adj(X509_get_notAfter(x509), 365 * 24 * 60 * 60);
+    // Set validity: random offset in past (0-30 days) to now+1 year
+    // Matches standard Tor behavior of randomizing notBefore
+    {
+        uint32_t rand_offset;
+        RAND_bytes(reinterpret_cast<uint8_t*>(&rand_offset), sizeof(rand_offset));
+        long past_offset = -static_cast<long>(rand_offset % (30 * 24 * 60 * 60));
+        X509_gmtime_adj(X509_get_notBefore(x509), past_offset);
+        X509_gmtime_adj(X509_get_notAfter(x509), 365 * 24 * 60 * 60);
+    }
 
     // Set public key
     X509_set_pubkey(x509, pkey);
 
-    // Set subject name
-    X509_NAME* name = X509_get_subject_name(x509);
-    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
-                               reinterpret_cast<const unsigned char*>("Tor relay"),
-                               -1, -1, 0);
-    X509_set_issuer_name(x509, name);
+    // Set subject name - use random-looking hostname to avoid fingerprinting
+    // Standard Tor generates random hostnames like "www.XXXXX.com"
+    {
+        uint8_t cn_rand[8];
+        RAND_bytes(cn_rand, sizeof(cn_rand));
+        std::ostringstream cn_oss;
+        cn_oss << "www.";
+        for (int i = 0; i < 8; ++i)
+            cn_oss << std::hex << std::setw(2) << std::setfill('0')
+                   << static_cast<int>(cn_rand[i]);
+        cn_oss << ".net";
+        std::string cn = cn_oss.str();
+
+        X509_NAME* name = X509_get_subject_name(x509);
+        X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+                                   reinterpret_cast<const unsigned char*>(cn.c_str()),
+                                   -1, -1, 0);
+        X509_set_issuer_name(x509, name);
+    }
 
     // Sign certificate
     if (X509_sign(x509, pkey, EVP_sha256()) == 0) {

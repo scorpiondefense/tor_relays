@@ -1,5 +1,6 @@
 #include "tor/crypto/keys.hpp"
 #include "tor/crypto/hash.hpp"
+#include <openssl/bn.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/err.h>
@@ -593,15 +594,33 @@ Rsa1024Identity::create_identity_cert() const {
         return std::unexpected(KeyError::OpenSSLError);
     }
 
-    ASN1_INTEGER_set(X509_get_serialNumber(x509), 1);
+    // Random serial number (avoid fingerprinting)
+    {
+        uint8_t serial_bytes[8];
+        RAND_bytes(serial_bytes, sizeof(serial_bytes));
+        BIGNUM* bn_serial = BN_bin2bn(serial_bytes, sizeof(serial_bytes), nullptr);
+        if (bn_serial) {
+            BN_to_ASN1_INTEGER(bn_serial, X509_get_serialNumber(x509));
+            BN_free(bn_serial);
+        }
+    }
     X509_gmtime_adj(X509_get_notBefore(x509), 0);
     X509_gmtime_adj(X509_get_notAfter(x509), 365 * 24 * 60 * 60);
     X509_set_pubkey(x509, pkey_);
 
-    X509_NAME* name = X509_get_subject_name(x509);
-    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
-        reinterpret_cast<const unsigned char*>("Tor relay"), -1, -1, 0);
-    X509_set_issuer_name(x509, name);
+    // Random CN to avoid fingerprinting (standard Tor uses random hostnames)
+    {
+        uint8_t cn_rand[6];
+        RAND_bytes(cn_rand, sizeof(cn_rand));
+        char cn_buf[32];
+        snprintf(cn_buf, sizeof(cn_buf), "www.%02x%02x%02x%02x%02x%02x.com",
+                 cn_rand[0], cn_rand[1], cn_rand[2],
+                 cn_rand[3], cn_rand[4], cn_rand[5]);
+        X509_NAME* name = X509_get_subject_name(x509);
+        X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+            reinterpret_cast<const unsigned char*>(cn_buf), -1, -1, 0);
+        X509_set_issuer_name(x509, name);
+    }
 
     if (X509_sign(x509, pkey_, EVP_sha256()) == 0) {
         X509_free(x509);
