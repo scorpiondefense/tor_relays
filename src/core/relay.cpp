@@ -188,7 +188,7 @@ static std::string build_bridge_descriptor(
     desc << "-----END ED25519 CERT-----\n";
     desc << "master-key-ed25519 " << ed_pub_b64 << "\n";
     desc << "platform Tor 0.4.9.5 on Linux\n";
-    desc << "proto Cons=1-2 Desc=1-2 FlowCtrl=1-2 HSDir=2 HSIntro=4-5 HSRend=1-2 Link=1-5 LinkAuth=1,3 Microdesc=1-2 Padding=2 Relay=1-4\n";
+    desc << "proto Cons=1-2 Desc=1-2 FlowCtrl=1-2 HSDir=2 HSIntro=4-5 HSRend=1-2 Link=1-5 LinkAuth=1,3 Microdesc=1-2 Padding=2 Relay=1-3\n";
     desc << "published " << time_buf << "\n";
     desc << "fingerprint " << fp_spaced << "\n";
     desc << "uptime 3600\n";
