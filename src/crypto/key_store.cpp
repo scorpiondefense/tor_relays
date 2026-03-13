@@ -1,12 +1,14 @@
 #include "tor/crypto/key_store.hpp"
 #include <openssl/sha.h>
 #include <fstream>
+#include <optional>
 
 namespace tor::crypto {
 
 static constexpr const char* ED25519_KEY_FILE = "ed25519_identity_secret_key";
 static constexpr const char* CURVE25519_KEY_FILE = "curve25519_onion_secret_key";
 static constexpr const char* RSA1024_KEY_FILE = "rsa1024_identity_secret_key";
+static constexpr const char* ED25519_ONION_KEY_FILE = "ed25519_onion_secret_key";
 static constexpr const char* FINGERPRINT_FILE = "fingerprint";
 
 KeyStore::KeyStore(std::filesystem::path data_dir)
@@ -130,13 +132,48 @@ std::expected<RelayKeyPair, KeyStoreError> KeyStore::load_keys() {
         }
     }
 
-    // Generate linked Ed25519/Curve25519 onion key pair for crosscerts.
-    // The loaded Curve25519 key is overridden because we need the Ed25519
-    // counterpart for ntor-onion-key-crosscert signing.
-    auto onion_ed = Ed25519SecretKey::generate();
-    if (!onion_ed) {
-        return std::unexpected(KeyStoreError::KeyGenerationFailed);
+    // Load or generate the onion Ed25519 key (needed for ntor-onion-key-crosscert signing).
+    // The Curve25519 onion key is derived from this Ed25519 seed so both share the same scalar.
+    std::optional<Ed25519SecretKey> onion_ed;
+    auto onion_ed_path = keys_dir_ / ED25519_ONION_KEY_FILE;
+    if (std::filesystem::exists(onion_ed_path)) {
+        std::ifstream onion_ed_file(onion_ed_path, std::ios::binary);
+        if (onion_ed_file) {
+            std::array<uint8_t, Ed25519SecretKey::SEED_SIZE> onion_ed_seed;
+            onion_ed_file.read(reinterpret_cast<char*>(onion_ed_seed.data()), onion_ed_seed.size());
+            if (onion_ed_file && onion_ed_file.gcount() == static_cast<std::streamsize>(onion_ed_seed.size())) {
+                auto loaded = Ed25519SecretKey::from_seed(onion_ed_seed);
+                if (loaded) {
+                    onion_ed = std::move(*loaded);
+                }
+                secure_zero(onion_ed_seed.data(), onion_ed_seed.size());
+            }
+        }
     }
+
+    if (!onion_ed) {
+        // Migration: no saved onion Ed25519 key, generate and persist one
+        auto generated = Ed25519SecretKey::generate();
+        if (!generated) {
+            return std::unexpected(KeyStoreError::KeyGenerationFailed);
+        }
+        onion_ed = std::move(*generated);
+
+        // Save the new onion Ed25519 seed
+        auto seed = onion_ed->seed();
+        std::ofstream out(onion_ed_path, std::ios::binary | std::ios::trunc);
+        if (out) {
+            out.write(reinterpret_cast<const char*>(seed.data()), seed.size());
+            out.close();
+            std::error_code perm_ec;
+            std::filesystem::permissions(onion_ed_path,
+                std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+                std::filesystem::perm_options::replace, perm_ec);
+        }
+        secure_zero(seed.data(), seed.size());
+    }
+
+    // Derive Curve25519 scalar from Ed25519 seed (same derivation as generate())
     auto ed_seed2 = onion_ed->seed();
     uint8_t hash2[64];
     SHA512(ed_seed2.data(), ed_seed2.size(), hash2);
@@ -145,6 +182,8 @@ std::expected<RelayKeyPair, KeyStoreError> KeyStore::load_keys() {
     hash2[31] |= 64;
     auto onion_linked = Curve25519SecretKey::from_bytes(
         std::span<const uint8_t>(hash2, 32));
+    secure_zero(ed_seed2.data(), ed_seed2.size());
+    secure_zero(hash2, sizeof(hash2));
     if (!onion_linked) {
         return std::unexpected(KeyStoreError::InvalidKeyData);
     }
@@ -208,6 +247,29 @@ std::expected<void, KeyStoreError> KeyStore::save_keys(const RelayKeyPair& keys)
 
     // Set 0600 permissions
     std::filesystem::permissions(curve_path,
+        std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+        std::filesystem::perm_options::replace, ec);
+    if (ec) {
+        return std::unexpected(KeyStoreError::PermissionError);
+    }
+
+    // Write Ed25519 onion key seed (for stable ntor/obfs4 identity across restarts)
+    auto onion_ed_path = keys_dir_ / ED25519_ONION_KEY_FILE;
+    {
+        auto onion_seed = keys.onion_ed_key.seed();
+        std::ofstream onion_ed_file(onion_ed_path, std::ios::binary | std::ios::trunc);
+        if (!onion_ed_file) {
+            return std::unexpected(KeyStoreError::IoError);
+        }
+
+        onion_ed_file.write(reinterpret_cast<const char*>(onion_seed.data()), onion_seed.size());
+        if (!onion_ed_file) {
+            return std::unexpected(KeyStoreError::IoError);
+        }
+    }
+
+    // Set 0600 permissions
+    std::filesystem::permissions(onion_ed_path,
         std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
         std::filesystem::perm_options::replace, ec);
     if (ec) {
