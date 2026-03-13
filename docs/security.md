@@ -4,12 +4,14 @@
 
 ### Threat Model
 
-This Tor relay implementation protects against:
+This Tor bridge relay implementation protects against:
 
-1. **Passive network observers** - All traffic is TLS encrypted
-2. **Active network attackers** - TLS with certificate pinning
-3. **Compromised relays** - Onion encryption (multiple layers)
-4. **Key theft** - Secure memory for cryptographic keys
+1. **Passive network observers** - obfs4 makes traffic indistinguishable from random; inner TLS layer
+2. **Active network attackers** - obfs4 handshake requires knowledge of the bridge cert; TLS with certificate pinning
+3. **DPI-based censorship** - obfs4 Elligator2 representation has no distinguishable pattern; IAT modes add padding
+4. **Compromised relays** - Onion encryption (multiple layers)
+5. **Key theft** - Secure memory for cryptographic keys, mlock, zeroed on destruction
+6. **Replay attacks** - obfs4 replay filter rejects duplicate handshake attempts
 
 ### Trust Boundaries
 
@@ -46,9 +48,14 @@ This Tor relay implementation protects against:
 
 | Key Type | Algorithm | Size | Lifetime | Storage |
 |----------|-----------|------|----------|---------|
-| Identity | Ed25519 | 256-bit | Permanent | Secure file |
-| Onion | Curve25519 | 256-bit | ~28 days | Secure file |
-| Circuit | AES-128 | 128-bit | Circuit lifetime | Memory only |
+| Ed25519 Identity | Ed25519 | 256-bit | Permanent | `/var/lib/tor/keys/ed25519_identity` |
+| Curve25519 Onion | Curve25519 | 256-bit | Permanent* | `/var/lib/tor/keys/curve25519_onion` |
+| RSA-1024 Identity | RSA | 1024-bit | Permanent | `/var/lib/tor/keys/rsa1024_identity` |
+| Ed25519 Onion | Ed25519 | 256-bit | Derived from Curve25519 seed | `/var/lib/tor/keys/ed25519_onion` |
+| Circuit | AES-128-CTR | 128-bit | Circuit lifetime | Memory only |
+| obfs4 Session | XSalsa20-Poly1305 | 256-bit | Connection lifetime | Memory only |
+
+*The Curve25519 onion key is critical: it determines the obfs4 `cert=` parameter. Losing it invalidates all client bridge lines. In Kubernetes, this key must be on a PVC.
 
 ### Key Generation
 
@@ -289,7 +296,7 @@ chroot = "/var/lib/tor"
 sandbox = true
 ```
 
-### Docker Security
+### Docker / Kubernetes Security
 
 ```yaml
 # docker-compose.yml security settings
@@ -306,16 +313,23 @@ services:
       - /tmp
 ```
 
+For Kubernetes deployments:
+- Use a PVC for `/var/lib/tor/` to persist keys across pod restarts
+- Set `securityContext.runAsUser: 1000` (tor user)
+- Set `securityContext.readOnlyRootFilesystem: true`
+- Resource requests: `cpu: 50m, memory: 128Mi` (cluster is CPU-saturated)
+
 ## Security Checklist
 
 ### Deployment
 
-- [ ] Run as non-root user
-- [ ] Restrict file permissions on keys
-- [ ] Enable firewall, allow only necessary ports
+- [ ] Run as non-root user (`tor`)
+- [ ] Restrict file permissions on keys (`chmod 600`)
+- [ ] Enable firewall, allow only ports 9002 (OR) and 9443 (obfs4)
 - [ ] Use secure DNS resolver
-- [ ] Keep system and dependencies updated
+- [ ] Keep system and dependencies updated (GCC 14+, OpenSSL 3.x)
 - [ ] Monitor logs for anomalies
+- [ ] Back up `/var/lib/tor/keys/` -- losing curve25519_onion breaks bridge lines
 
 ### Configuration
 
@@ -324,13 +338,15 @@ services:
 - [ ] Enable secure memory
 - [ ] Set reasonable connection limits
 - [ ] Configure log rotation
+- [ ] Set `iat_mode = 0` unless clients need padding
 
 ### Monitoring
 
 - [ ] Monitor for unusual traffic patterns
 - [ ] Alert on authentication failures
-- [ ] Track circuit creation rates
-- [ ] Monitor resource usage
+- [ ] Track circuit creation rates and EXTEND2 success rate
+- [ ] Monitor resource usage (thread count, memory)
+- [ ] Watch for SIGSEGV in logs (use-after-free in EXTEND2 was fixed in v0.1.80)
 
 ## Vulnerability Reporting
 

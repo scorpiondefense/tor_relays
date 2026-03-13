@@ -104,7 +104,7 @@ target_compile_options(tor_lib PRIVATE ${TOR_WARNINGS})
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS "11")
     target_compile_options(tor_lib PUBLIC -fconcepts -fcoroutines)
 endif()
-# AppleClang and modern GCC/Clang support C++20 coroutines natively
+# AppleClang and modern GCC/Clang support C++23 coroutines natively
 
 # Main executable
 add_executable(tor_relay src/main.cpp)

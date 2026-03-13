@@ -1,35 +1,38 @@
 # Tor Relay Documentation
 
-A production-ready Tor relay implementation in C++20 supporting runtime mode switching between Middle, Exit, and Bridge relay modes.
+A production-ready Tor relay implementation in C++23 supporting runtime mode switching between Middle, Exit, Guard, and Bridge relay modes with integrated obfs4 pluggable transport.
 
 ## Table of Contents
 
-- [Overview](overview.md)
-- [Installation](installation.md)
-- [Configuration](configuration.md)
-- [Deployment](deployment.md)
-- [Architecture](architecture.md)
-- [API Reference](api-reference.md)
-- [Testing](testing.md)
-- [Security](security.md)
-- [Troubleshooting](troubleshooting.md)
+- [Overview](overview.md) - Architecture, relay modes, and protocol support
+- [Installation](installation.md) - Build from source with obfs4_cpp dependency
+- [Configuration](configuration.md) - TOML config, CLI options, environment variables
+- [Deployment](deployment.md) - Docker, Kubernetes, and VPS deployment guide (includes obfs4 bridge)
+- [Architecture](architecture.md) - Technical deep-dive into components, data flow, and threading
+- [API Reference](api-reference.md) - Code documentation and type reference
+- [Testing](testing.md) - Test framework, categories, and coverage
+- [Security](security.md) - Threat model, key management, and operational security
+- [Troubleshooting](troubleshooting.md) - Common issues, diagnostics, and bridge-specific fixes
 
 ## Quick Start
 
 ```bash
-# Clone and build
+# Clone monorepo (needs both tor_relays/ and obfs4_cpp/)
 git clone <repository>
-cd tor_relay
+cd monorepo/tor_relays
+
+# Build
 mkdir build && cd build
-conan install .. --build=missing
-cmake .. -DCMAKE_TOOLCHAIN_FILE=conan_toolchain.cmake
-cmake --build .
+cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=/usr/bin/g++-14
+cmake --build . --parallel
 
-# Run as middle relay (safest default)
-./tor_relay --mode middle --port 9001
+# Run as bridge with obfs4
+./tor_relay --mode bridge --port 9002 -f -l info --data-dir /var/lib/tor
 
-# Run with Docker
-docker-compose up -d
+# Run with Docker (from monorepo root)
+docker build -f infrastructure/docker/Dockerfile.tor-relays -t tor-relays .
+docker run -p 9002:9002 -p 9443:9443 -v tor-data:/var/lib/tor tor-relays \
+    -m bridge -p 9002 -n MyBridge -f --data-dir /var/lib/tor
 ```
 
 ## Relay Modes
@@ -37,16 +40,17 @@ docker-compose up -d
 | Mode | Description | Risk Level |
 |------|-------------|------------|
 | **Middle** | Forward relay cells only | Low |
+| **Guard** | Stable entry relay | Low |
 | **Exit** | Connect to external internet | High |
-| **Bridge** | Unpublished entry for censored users | Medium |
+| **Bridge** | Unpublished entry with obfs4 for censored users | Medium |
 
 ## Requirements
 
-- C++20 compatible compiler (GCC 11+, Clang 14+, MSVC 2022+)
+- C++23 compatible compiler (GCC 14+ recommended, GCC 11+, Clang 14+)
 - OpenSSL 3.x
 - Boost 1.82+
 - CMake 3.21+
-- Conan 2.x (optional, for dependencies)
+- obfs4_cpp library (sibling directory in monorepo)
 
 ## License
 

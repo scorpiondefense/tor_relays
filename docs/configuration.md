@@ -4,6 +4,8 @@
 
 The relay uses TOML format for configuration. Default location: `/etc/tor/relay.toml`
 
+An example file is provided at `config/relay.toml.example`.
+
 ### Complete Example
 
 ```toml
@@ -13,14 +15,14 @@ The relay uses TOML format for configuration. Default location: `/etc/tor/relay.
 # Relay nickname (1-19 alphanumeric characters)
 nickname = "MyTorRelay"
 
-# Operating mode: "middle", "exit", or "bridge"
-mode = "middle"
+# Operating mode: "middle", "exit", "bridge", or "guard"
+mode = "bridge"
 
 # OR (Onion Router) port - main relay port
-or_port = 9001
+or_port = 9002
 
 # Directory port (0 to disable)
-dir_port = 9030
+dir_port = 0
 
 # Contact information (optional but recommended)
 contact = "admin@example.com"
@@ -73,11 +75,18 @@ reject_private = true
 # Options: "https", "email", "moat", "none"
 distribution = "https"
 
-# Pluggable transport settings (optional)
+# Pluggable transport settings
 [bridge.transport]
-enabled = false
+enabled = true
 type = "obfs4"
-bind_address = "0.0.0.0:9002"
+# Port for the obfs4 transport listener (default: 9443)
+# 443 mimics HTTPS traffic, making it harder to block
+port = 9443
+# IAT (Inter-Arrival Time) obfuscation mode:
+#   0 = Off (no padding)
+#   1 = Enabled (add random padding to packets)
+#   2 = Paranoid (add random padding + timing jitter)
+iat_mode = 0
 
 [directory]
 # Publish server descriptor to directory authorities
@@ -141,12 +150,12 @@ Usage: tor_relay [OPTIONS]
 
 Options:
   -c, --config FILE     Configuration file path
-  -m, --mode MODE       Relay mode: middle, exit, bridge
+  -m, --mode MODE       Relay mode: middle, exit, bridge, guard
   -p, --port PORT       OR port to listen on
   -d, --dir-port PORT   Directory port (0 to disable)
   -n, --nickname NAME   Relay nickname
-  --data-dir DIR        Data directory
-  -f, --foreground      Run in foreground
+  --data-dir DIR        Data directory for keys and state
+  -f, --foreground      Run in foreground (don't daemonize)
   -l, --log-level LEVEL Log level: trace, debug, info, warn, error
   -h, --help            Show help
   -v, --version         Show version
@@ -155,14 +164,17 @@ Options:
 ### Examples
 
 ```bash
+# Bridge relay with obfs4 (production mode)
+./tor_relay --mode bridge --port 9002 -f -l info
+
+# Bridge relay with config file and debug logging
+./tor_relay --mode bridge --config /etc/tor/relay.toml -f -l debug
+
 # Middle relay with custom port
 ./tor_relay --mode middle --port 443
 
-# Exit relay with config file
-./tor_relay --mode exit --config /etc/tor/exit.toml
-
-# Bridge relay in foreground with debug logging
-./tor_relay --mode bridge --port 9001 -f -l debug
+# Guard relay
+./tor_relay --mode guard --port 9001
 
 # Override config file settings
 ./tor_relay -c /etc/tor/relay.toml --port 9002 --nickname "OverrideNick"
@@ -251,3 +263,31 @@ Non-reloadable settings (require restart):
 - Mode
 - Port numbers
 - Identity keys
+- Transport settings
+
+## Bridge Line
+
+When running in bridge mode with obfs4, the relay logs its bridge line at startup. The format is:
+
+```
+Bridge obfs4 <IP>:9443 <FINGERPRINT> cert=<CERT> iat-mode=0
+```
+
+- `<IP>` is the relay's public IP address
+- `9443` is the obfs4 listener port (configurable via `[bridge.transport] port`)
+- `<FINGERPRINT>` is the hex-encoded SHA-1 of the RSA-1024 identity key DER
+- `<CERT>` is `base64url_nopad(node_id[20] || curve25519_onion_pubkey[32])` (52 bytes, 70 chars)
+- `iat-mode=0` matches the configured IAT mode
+
+Clients add this line to their `torrc` or Tor Browser bridge settings.
+
+## Key Persistence
+
+Keys are stored in `{data_dir}/keys/`:
+- `ed25519_identity` -- long-term Ed25519 identity (seed)
+- `ed25519_onion` -- Ed25519 key derived from onion key seed
+- `curve25519_onion` -- Curve25519 ntor key (also determines obfs4 cert)
+- `rsa1024_identity` -- legacy RSA-1024 identity (DER)
+- `fingerprint` -- "{nickname} {hex fingerprint}"
+
+**The curve25519_onion key determines the obfs4 certificate.** If this key is lost, all existing client bridge lines become invalid. Always back up `/var/lib/tor/keys/` and use persistent volumes in Kubernetes.

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Production-ready Tor relay implementation in C++20 supporting Middle, Exit, and Bridge relay modes with runtime switching. Implements full Tor protocol including ntor handshake, circuit management, and relay cell processing.
+Production-ready Tor relay implementation in C++23 supporting Middle, Exit, Guard, and Bridge relay modes with runtime switching. Implements full Tor protocol including ntor handshake, circuit management, and relay cell processing.
 
 ## Build Commands
 
@@ -34,7 +34,7 @@ conan install . --build=missing --output-folder=build
 
 ## Dependencies
 
-- **CMake 3.21+**, **C++20 compiler** (GCC 11+, Clang 14+, MSVC 2022+)
+- **CMake 3.21+**, **C++23 compiler** (GCC 14+, Clang 17+)
 - **OpenSSL 3.0+** - Cryptography
 - **Boost 1.82+** - Asio for async I/O
 - **spdlog 1.13.0** - Logging (via Conan)

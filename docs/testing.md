@@ -59,24 +59,30 @@ ctest -V -R "ntor"
 
 ```
 tests/
-├── test_main.cpp           # Catch2 main (defines CATCH_CONFIG_MAIN)
+├── test_main.cpp                        # Catch2 main
 ├── unit/
-│   ├── test_cell.cpp       # Cell protocol tests
-│   ├── test_crypto.cpp     # Cryptographic primitives
-│   ├── test_circuit.cpp    # Circuit state machine
-│   ├── test_exit_policy.cpp # Exit policy matching
-│   └── test_config.cpp     # Configuration parsing
+│   ├── test_cell.cpp                    # Cell protocol tests (temporarily excluded*)
+│   ├── test_crypto.cpp                  # Cryptographic primitives
+│   ├── test_circuit.cpp                 # Circuit state machine (temporarily excluded*)
+│   ├── test_exit_policy.cpp             # Exit policy matching
+│   ├── test_config.cpp                  # Configuration parsing
+│   ├── test_guard_relay.cpp             # Guard relay mode
+│   ├── test_key_store.cpp               # Key persistence
+│   └── test_obfs4.cpp                   # obfs4 identity, cert encoding
 ├── integration/
-│   ├── test_tls.cpp        # TLS handshake tests
-│   ├── test_circuit_creation.cpp  # Full circuit flow
-│   └── test_directory.cpp  # Descriptor building
+│   ├── test_tls.cpp                     # TLS handshake tests
+│   ├── test_circuit_creation.cpp        # Full circuit flow (temporarily excluded*)
+│   ├── test_directory.cpp               # Descriptor building
+│   └── test_obfs4_transport.cpp         # obfs4 handshake + framing
 ├── mocks/
-│   ├── mock_network.hpp    # Network mocking utilities
-│   └── mock_crypto.hpp     # Crypto mocking utilities
+│   ├── mock_network.hpp                 # Network mocking utilities
+│   └── mock_crypto.hpp                  # Crypto mocking utilities
 └── fixtures/
-    ├── cell_fixtures.hpp   # Pre-built test cells
-    └── key_fixtures.hpp    # Test vectors for crypto
+    ├── cell_fixtures.hpp                # Pre-built test cells
+    └── key_fixtures.hpp                 # Test vectors for crypto
 ```
+
+*Tests marked "temporarily excluded" have pre-existing API mismatches with the current core library and are commented out in `CMakeLists.txt`.
 
 ## Test Categories
 
@@ -140,6 +146,23 @@ TEST_CASE("Ed25519 signature - RFC 8032 vectors", "[crypto][ed25519][unit]") {
     auto signature = secret.sign(message);
     CHECK(signature == expected_sig);
     CHECK(secret.public_key().verify(message, signature));
+}
+```
+
+### obfs4 Tests (`[obfs4]`)
+
+Test obfs4 identity encoding and transport integration.
+
+```cpp
+TEST_CASE("Obfs4 cert encoding", "[obfs4][unit]") {
+    // cert = base64url_nopad(node_id[20] || curve25519_pubkey[32])
+    auto identity = Obfs4Identity{node_id, onion_key.public_key()};
+    auto cert = identity.to_cert();
+    CHECK(cert.size() == 70);  // ceil(52 * 4/3) without padding
+
+    auto decoded = Obfs4Identity::from_cert(cert);
+    REQUIRE(decoded.has_value());
+    CHECK(decoded->node_id == node_id);
 }
 ```
 
@@ -313,29 +336,25 @@ std::vector<uint8_t> random_bytes(size_t count);
 
 ## Continuous Integration
 
-### GitHub Actions Example
+Builds are triggered via Jenkins at `builder.mylobster.ai`. The CI pipeline:
 
-```yaml
-name: Tests
-on: [push, pull_request]
+1. Checks out the monorepo (including `obfs4_cpp` sibling)
+2. Runs `conan install` for dependencies
+3. Builds with CMake (`-DCMAKE_BUILD_TYPE=Release`)
+4. Runs tests via `ctest`
+5. Builds Docker image and pushes to DigitalOcean Container Registry
 
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+Tags follow the pattern `vX.Y.Z` (e.g., `v0.1.80`). The Conan cache stage sometimes fails due to cache corruption, but this does not affect the Docker build.
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev libboost-all-dev
+### Local CI Equivalent
 
-      - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug
-
-      - name: Build
-        run: cmake --build build --parallel
-
-      - name: Test
-        run: ctest --test-dir build --output-on-failure
+```bash
+# From monorepo root, same steps as Jenkins
+cd tor_relays
+conan install . --build=missing --output-folder=build
+cd build
+cmake .. -DCMAKE_TOOLCHAIN_FILE=conan_toolchain.cmake \
+         -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
+cmake --build . --parallel
+ctest --output-on-failure
 ```

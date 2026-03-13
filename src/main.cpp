@@ -45,7 +45,7 @@ struct CommandLineArgs {
 
 void print_usage(const char* program_name) {
     std::cout << "Usage: " << program_name << " [OPTIONS]\n\n"
-              << "Tor Relay Implementation - C++20\n\n"
+              << "Tor Relay Implementation - C++23\n\n"
               << "Options:\n"
               << "  -c, --config FILE     Configuration file path\n"
               << "  -m, --mode MODE       Relay mode: middle, exit, bridge, guard (default: middle)\n"
@@ -74,7 +74,7 @@ void print_usage(const char* program_name) {
 void print_version() {
     std::cout << "Tor Relay Implementation v" << static_cast<int>(tor::core::VersionInfo::MAJOR) << "."
               << static_cast<int>(tor::core::VersionInfo::MINOR) << "." << static_cast<int>(tor::core::VersionInfo::PATCH) << "\n"
-              << "Built with C++20, OpenSSL 3.x, Boost.Asio\n"
+              << "Built with C++23, OpenSSL 3.x, Boost.Asio\n"
               << "Protocol versions: 4, 5\n";
 }
 

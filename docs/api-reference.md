@@ -149,16 +149,51 @@ public:
     bool is_low_order() const;
 };
 
-// Node identifier (20-byte SHA-1 of identity key)
+// RSA 1024-bit identity key (legacy, required for Tor link protocol CERTS cell)
+class Rsa1024Identity {
+public:
+    static Result<Rsa1024Identity> generate();
+    static Result<Rsa1024Identity> from_der_private(std::span<const uint8_t> der);
+
+    std::vector<uint8_t> private_key_der() const;
+    std::vector<uint8_t> public_key_der() const;
+    std::vector<uint8_t> rsa_public_key_der() const;  // PKCS#1 RSAPublicKey for fingerprint
+
+    Result<std::vector<uint8_t>> sign_sha256(std::span<const uint8_t> data) const;
+    Result<std::vector<uint8_t>> sign_raw(std::span<const uint8_t> data) const;
+
+    // Certificate generation for CERTS cell
+    Result<std::vector<uint8_t>> create_identity_cert() const;     // Type 2
+    Result<std::vector<uint8_t>> create_link_cert(EVP_PKEY* tls_pkey) const;  // Type 1
+    Result<std::vector<uint8_t>> create_ed25519_cross_cert(const Ed25519PublicKey& ed_pub) const;  // Type 7
+
+    bool is_valid() const;
+};
+
+// Relay key bundle (all four key types)
+struct RelayKeyPair {
+    Ed25519SecretKey identity_key;      // ed25519_identity
+    Curve25519SecretKey onion_key;      // curve25519_onion (determines obfs4 cert!)
+    Rsa1024Identity rsa_identity;       // rsa1024_identity
+    Ed25519SecretKey onion_ed_key;      // derived from onion_key seed
+    uint8_t onion_ed_sign_bit = 0;
+
+    static Result<RelayKeyPair> generate();
+};
+
+// Node identifier (20-byte SHA-1 of RSA public key DER)
 class NodeId {
 public:
     NodeId();
     explicit NodeId(const Ed25519PublicKey& identity);
+    explicit NodeId(std::span<const uint8_t> rsa_public_key_der);
     static Result<NodeId> from_bytes(std::span<const uint8_t, 20> bytes);
-    static Result<NodeId> from_hex(std::string_view hex);
+    static Result<NodeId> from_hex(const std::string& hex);
+    static Result<NodeId> from_base64(const std::string& b64);
 
     std::span<const uint8_t, 20> as_bytes() const;
     std::string to_hex() const;
+    std::string to_base64() const;
 };
 
 }  // namespace tor::crypto
@@ -251,6 +286,108 @@ public:
 };
 
 }  // namespace tor::crypto
+```
+
+## Key Persistence
+
+```cpp
+namespace tor::crypto {
+
+class KeyStore {
+public:
+    explicit KeyStore(std::filesystem::path data_dir);
+
+    // Load existing keys or generate and save new ones
+    Result<RelayKeyPair> load_or_generate();
+
+    // Write fingerprint file: "{data_dir}/fingerprint"
+    Result<void> write_fingerprint(const std::string& nickname, const NodeId& node_id);
+};
+
+}  // namespace tor::crypto
+```
+
+## obfs4 Transport
+
+```cpp
+namespace tor::transport {
+
+// obfs4 server identity: node_id + curve25519 onion key
+struct Obfs4Identity {
+    crypto::NodeId node_id;
+    crypto::Curve25519PublicKey ntor_public_key;
+
+    // Generate cert string: base64url_nopad(node_id[20] || pubkey[32])
+    std::string to_cert() const;
+    static Result<Obfs4Identity> from_cert(const std::string& cert);
+};
+
+// IAT modes
+enum class IatMode : uint8_t {
+    Off = 0,      // No IAT obfuscation
+    Enabled = 1,  // Add random padding
+    Paranoid = 2, // Padding + delay
+};
+
+// Server handshake state machine
+class Obfs4ServerHandshake {
+public:
+    enum class State { WaitingForMark, WaitingForMac, Completed, Failed };
+
+    Obfs4ServerHandshake(const crypto::NodeId& node_id,
+                         const crypto::Curve25519SecretKey& identity_key);
+
+    Result<size_t> consume(std::span<const uint8_t> data);
+    Result<std::vector<uint8_t>> generate_server_hello();
+    State state() const;
+
+    struct SessionKeys {
+        std::array<uint8_t, 32> send_key, recv_key;
+        std::array<uint8_t, 24> send_nonce, recv_nonce;
+        std::array<uint8_t, 24> send_drbg_seed, recv_drbg_seed;
+    };
+    const SessionKeys& session_keys() const;
+};
+
+// Frame encode/decode
+class Obfs4Framing {
+public:
+    void init_send(std::span<const uint8_t, 32> key,
+                   std::span<const uint8_t, 24> initial_nonce,
+                   std::span<const uint8_t, 24> drbg_seed);
+    void init_recv(/* same params */);
+
+    std::vector<uint8_t> encode(std::span<const uint8_t> payload);
+
+    struct DecodeResult {
+        std::vector<std::vector<uint8_t>> frames;
+        size_t consumed;
+    };
+    Result<DecodeResult> decode(std::span<const uint8_t> data);
+};
+
+// TCP listener that performs obfs4 handshake, then proxies to local OR port
+class Obfs4Listener {
+public:
+    Obfs4Listener(boost::asio::io_context& io_context,
+                  const crypto::NodeId& node_id,
+                  const crypto::Curve25519SecretKey& identity_key,
+                  IatMode iat_mode = IatMode::Off);
+
+    Result<void> start(const std::string& address, uint16_t port);
+    void stop();
+
+    const std::string& cert() const;  // For bridge line generation
+    void set_or_port(uint16_t port);  // Default: 9001
+
+    // Statistics
+    uint64_t connections_accepted() const;
+    uint64_t handshakes_completed() const;
+    uint64_t handshakes_failed() const;
+    bool is_listening() const;
+};
+
+}  // namespace tor::transport
 ```
 
 ## Circuit Management
@@ -365,7 +502,7 @@ public:
 ```cpp
 namespace tor::modes {
 
-enum class RelayMode { Middle, Exit, Bridge };
+enum class RelayMode { Middle, Exit, Bridge, Guard };
 enum class RelayOperation {
     ForwardRelay,
     ExtendCircuit,
@@ -379,12 +516,16 @@ public:
     virtual ~RelayBehavior() = default;
 
     virtual RelayMode mode() const = 0;
-    virtual Result<void> handle_relay_cell(core::Circuit& circuit,
+    virtual std::string mode_name() const = 0;
+    virtual Result<void> handle_relay_cell(std::shared_ptr<core::Circuit> circuit,
                                            core::RelayCell& cell) = 0;
-    virtual Result<void> handle_begin(core::Circuit& circuit,
-                                      const RelayBeginCell& begin) = 0;
+    virtual Result<void> handle_begin(std::shared_ptr<core::Circuit> circuit,
+                                      const core::RelayCell& begin) = 0;
+    virtual Result<void> handle_extend(std::shared_ptr<core::Circuit> circuit,
+                                       const core::RelayCell& extend) = 0;
     virtual bool allows_operation(RelayOperation op) const = 0;
     virtual std::string descriptor_additions() const = 0;
+    virtual Result<void> validate_config() const = 0;
 };
 
 // Factory function
@@ -404,17 +545,25 @@ namespace tor::util {
 
 struct RelayConfig {
     std::string nickname;
-    RelayMode mode{RelayMode::Middle};
-    uint16_t or_port{9001};
+    modes::RelayMode mode{modes::RelayMode::Middle};
+    uint16_t or_port{9002};
     uint16_t dir_port{0};
     std::string address;
     std::string contact;
+    std::filesystem::path data_dir{"/var/lib/tor"};
 
     struct Bandwidth {
         size_t rate{0};
         size_t burst{0};
         size_t advertised{0};
     } bandwidth;
+};
+
+struct BridgeConfig {
+    std::string transport;         // "obfs4" or empty
+    uint16_t transport_port{9443}; // obfs4 listener port
+    uint8_t iat_mode{0};          // IAT obfuscation mode
+    std::string distribution{"https"};
 };
 
 struct ExitConfig {
@@ -425,20 +574,18 @@ struct ExitConfig {
 
 struct Config {
     RelayConfig relay;
+    BridgeConfig bridge;
     ExitConfig exit;
     DirectoryConfig directory;
     LoggingConfig logging;
-    std::string data_directory{"/var/lib/tor"};
 
-    static Result<Config> load(const std::string& path);
+    static Result<Config> load_from_file(const std::string& path);
     static Config default_config();
 
     bool is_exit() const;
     bool is_bridge() const;
     policy::ExitPolicy effective_exit_policy() const;
 };
-
-Result<RelayMode> parse_relay_mode(std::string_view str);
 
 }  // namespace tor::util
 ```
@@ -452,26 +599,24 @@ class Relay {
 public:
     Result<void> start();
     Result<void> stop();
-    Result<void> reload_config(const util::Config& config);
 
     bool is_running() const;
-    RelayStats stats() const;
-    std::string fingerprint() const;
+
+    // Runtime mode switching
+    Result<void> switch_mode(modes::RelayMode new_mode);
+    modes::RelayMode mode() const;
+
+    // Access internals
+    std::shared_ptr<ChannelManager> channel_manager() const;
+    modes::RelayBehavior* behavior() const;
+    const crypto::RelayKeyPair* keys() const;
+    const crypto::NodeId& fingerprint() const;
 };
 
 class RelayBuilder {
 public:
-    RelayBuilder& config(const util::Config& config);
-    RelayBuilder& io_context(boost::asio::io_context& ctx);
+    RelayBuilder& config(util::Config& cfg);
     Result<std::unique_ptr<Relay>> build();
-};
-
-struct RelayStats {
-    size_t circuits_active;
-    size_t circuits_total;
-    size_t bytes_read;
-    size_t bytes_written;
-    std::chrono::steady_clock::time_point started_at;
 };
 
 }  // namespace tor::core
