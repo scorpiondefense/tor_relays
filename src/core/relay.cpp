@@ -100,9 +100,9 @@ static std::vector<uint8_t> build_descriptor_ed_cert(
     // N_EXTENSIONS = 1
     body.push_back(1);
     // Extension: SignedWithEd25519Key (type 4)
-    // ExtLength includes ExtType(1) + ExtFlags(1) + ExtData(32) = 34
-    // per trunnel definition: un_parsed[ext_length - 2]
-    body.push_back(0x00); body.push_back(0x22); // ExtLength = 34
+    // ExtLength is the length of the extension *data* only (32 bytes for Ed25519 key).
+    // The trunnel parser reads ExtType(1) + ExtFlags(1) separately, then ExtData[ExtLen].
+    body.push_back(0x00); body.push_back(0x20); // ExtLength = 32
     body.push_back(0x04); // ExtType = SignedWithEd25519Key
     body.push_back(0x01); // ExtFlags = AFFECTS_VALIDATION
     auto sk = signer_pub.as_span();
