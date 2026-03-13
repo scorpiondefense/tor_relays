@@ -328,6 +328,18 @@ struct NextHopState {
     std::atomic<bool> running{true};
     std::thread reader_thread;
 
+    // Own the io_context and TlsContext so they outlive the TLS connection.
+    // These were previously stack locals in the EXTEND2 handler block,
+    // causing use-after-free when the block exited but ext_conn still held
+    // dangling references → SIGSEGV on socket close.
+    std::unique_ptr<boost::asio::io_context> ext_io;
+    std::unique_ptr<crypto::TlsContext> ext_tls;
+
+    // Own backward cipher to avoid data race on circuits map.
+    // The reader thread encrypts backward cells with this cipher;
+    // the main thread no longer accesses it after EXTEND2 setup.
+    crypto::AesCtr128 backward_cipher;
+
     ~NextHopState() {
         running = false;
         if (channel) channel->close();
@@ -1399,9 +1411,11 @@ std::expected<void, RelayError> Relay::start() {
                                  target_ip, target_port, htype, hlen);
 
                         // Connect to target relay via TLS
-                        boost::asio::io_context ext_io;
-                        crypto::TlsContext ext_tls;
-                        auto ext_tls_init = ext_tls.init_client();
+                        // Heap-allocate io_context and TlsContext so they
+                        // outlive this block — they're moved into NextHopState.
+                        auto ext_io_ptr = std::make_unique<boost::asio::io_context>();
+                        auto ext_tls_ptr = std::make_unique<crypto::TlsContext>();
+                        auto ext_tls_init = ext_tls_ptr->init_client();
                         if (!ext_tls_init) {
                             LOG_WARN("OR: EXTEND2 TLS client init failed");
                             auto end_cell = encrypt_relay_cell(
@@ -1411,7 +1425,7 @@ std::expected<void, RelayError> Relay::start() {
                             continue;
                         }
 
-                        auto ext_conn = std::make_shared<net::TlsConnection>(ext_io, ext_tls);
+                        auto ext_conn = std::make_shared<net::TlsConnection>(*ext_io_ptr, *ext_tls_ptr);
                         ext_conn->set_connect_timeout(std::chrono::milliseconds(10000));
                         auto conn_result = ext_conn->connect(target_ip, target_port);
                         if (!conn_result) {
@@ -1570,16 +1584,25 @@ std::expected<void, RelayError> Relay::start() {
                         // 8. Start backward relay cell reader for this next hop
                         auto nh = std::make_unique<NextHopState>();
                         nh->channel = nh_channel;
+
+                        // Transfer ownership of io_context and TlsContext to
+                        // NextHopState so they outlive the TLS connection.
+                        nh->ext_io = std::move(ext_io_ptr);
+                        nh->ext_tls = std::move(ext_tls_ptr);
+
+                        // Move the backward cipher to NextHopState so the
+                        // reader thread can encrypt without accessing the
+                        // circuits map (avoids data race from rehash).
+                        nh->backward_cipher = std::move(cc.backward_cipher);
+
                         auto nh_running = &nh->running;
+                        auto nh_backward = &nh->backward_cipher;
                         auto client_channel = channel;
                         auto circ_id_copy = circ_id;
 
-                        // Store circuits ref for backward encryption
-                        auto circuits_ptr = &circuits;
-
                         nh->reader_thread = std::thread(
                             [nh_channel, client_channel, circ_id_copy,
-                             nh_running, circuits_ptr]() {
+                             nh_running, nh_backward]() {
                             while (nh_running->load() &&
                                    nh_channel->is_open() &&
                                    client_channel->is_open()) {
@@ -1593,14 +1616,10 @@ std::expected<void, RelayError> Relay::start() {
                                 }
 
                                 if (cell->command == CellCommand::RELAY) {
-                                    // Backward direction: encrypt with Kb
-                                    auto c_it = circuits_ptr->find(circ_id_copy);
-                                    if (c_it == circuits_ptr->end()) break;
-
                                     Cell back_cell(circ_id_copy, CellCommand::RELAY);
                                     back_cell.payload = cell->payload;
                                     // Encrypt payload with backward cipher (Kb)
-                                    auto enc = c_it->second.backward_cipher.process(
+                                    auto enc = nh_backward->process(
                                         std::span<uint8_t>(back_cell.payload.data(),
                                                            PAYLOAD_LEN));
                                     if (!enc) break;
