@@ -1,5 +1,6 @@
 #include "tor/crypto/key_store.hpp"
 #include <openssl/sha.h>
+#include <cstring>
 #include <fstream>
 #include <optional>
 
@@ -170,19 +171,21 @@ std::expected<RelayKeyPair, KeyStoreError> KeyStore::load_keys() {
                 std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
                 std::filesystem::perm_options::replace, perm_ec);
         }
-        secure_zero(seed.data(), seed.size());
     }
 
     // Derive Curve25519 scalar from Ed25519 seed (same derivation as generate())
-    auto ed_seed2 = onion_ed->seed();
+    // Copy seed to mutable buffer for SHA512 + secure zeroing
+    auto ed_seed_const = onion_ed->seed();
+    std::array<uint8_t, Ed25519SecretKey::SEED_SIZE> ed_seed_buf;
+    std::memcpy(ed_seed_buf.data(), ed_seed_const.data(), ed_seed_buf.size());
     uint8_t hash2[64];
-    SHA512(ed_seed2.data(), ed_seed2.size(), hash2);
+    SHA512(ed_seed_buf.data(), ed_seed_buf.size(), hash2);
     hash2[0] &= 248;
     hash2[31] &= 127;
     hash2[31] |= 64;
     auto onion_linked = Curve25519SecretKey::from_bytes(
         std::span<const uint8_t>(hash2, 32));
-    secure_zero(ed_seed2.data(), ed_seed2.size());
+    secure_zero(ed_seed_buf.data(), ed_seed_buf.size());
     secure_zero(hash2, sizeof(hash2));
     if (!onion_linked) {
         return std::unexpected(KeyStoreError::InvalidKeyData);
